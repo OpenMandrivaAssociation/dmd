@@ -1,0 +1,15 @@
+diff -ru dmd-2.112.0-beta.1.orig/compiler/src/dmd/link.d dmd-2.112.0-beta.1/compiler/src/dmd/link.d
+--- dmd-2.112.0-beta.1.orig/compiler/src/dmd/link.d	2025-05-02 11:46:46.000000000 +0200
++++ dmd-2.112.0-beta.1/compiler/src/dmd/link.d	2025-12-03 22:43:57.536326573 +0100
+@@ -503,6 +503,11 @@
+             argv.push("-Xlinker");
+             argv.push("--gc-sections");
+         }
++        else
++        {
++            argv.push("-Xlinker");
++            argv.push("--no-gc-sections");
++        }
+ 
+         // return true if flagp should be ordered in with the library flags
+         static bool flagIsLibraryRelated(const char* p)

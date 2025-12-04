@@ -1,0 +1,4 @@
+sources:
+  dmd-2.112.0-beta.1.tar.gz: 5ab0561e096c20c8cfbf2254670ab220e3e60404
+  phobos-2.112.0-beta.1.tar.gz: 138ca2b1eeb7d46fbed331720d7b3fd65ff7ba4e
+  dmd.2.111.0.linux.tar.xz: e47944ac89d59b0d3ea57e62c65baa273285da1d

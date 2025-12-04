@@ -1,0 +1,103 @@
+From 83d655020b37cfb4e79ddcf2f6fa076cafce528a Mon Sep 17 00:00:00 2001
+From: Andrei Horodniceanu <a.horodniceanu@proton.me>
+Date: Mon, 12 May 2025 23:25:15 +0300
+Subject: [PATCH 1/3] druntime/src/importc.h: Use __linux__ instead of linux
+
+Stay consistent with the rest of the preprocessor conditionals by
+checking for __linux__ instead of linux. Additionally, the former also
+works with -std=c11 whereas the latter only works with -std=gnu11.
+
+Signed-off-by: Andrei Horodniceanu <a.horodniceanu@proton.me>
+---
+ compiler/test/compilable/fix24187.c | 2 +-
+ druntime/src/importc.h              | 2 +-
+ 2 files changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/compiler/test/compilable/fix24187.c b/compiler/test/compilable/fix24187.c
+index 42283c114fbc..a16eb22d0672 100644
+--- a/compiler/test/compilable/fix24187.c
++++ b/compiler/test/compilable/fix24187.c
+@@ -2,7 +2,7 @@
+ 
+ // https://issues.dlang.org/show_bug.cgi?id=24187
+ 
+-#ifdef linux
++#ifdef __linux__
+ #ifndef __clang__
+ extern _Complex _Float32 cacosf32 (_Complex _Float32 __z) __attribute__ ((__nothrow__ , __leaf__));
+ 
+diff --git a/druntime/src/importc.h b/druntime/src/importc.h
+index 68c767df341a..4f5b3efcffa0 100644
+--- a/druntime/src/importc.h
++++ b/druntime/src/importc.h
+@@ -169,7 +169,7 @@ typedef unsigned long long __uint64_t;
+ #define __STDC_NO_VLA__ 1
+ 
+ #define _Float16 float
+-#if linux  // Microsoft won't allow the following macro
++#ifdef __linux__  // Microsoft won't allow the following macro
+ // Ubuntu's assert.h uses this
+ #define __PRETTY_FUNCTION__ __func__
+ 
+
+From 89daa47b1aefd38c33940da16dfbc2f0f2e9ff29 Mon Sep 17 00:00:00 2001
+From: Andrei Horodniceanu <a.horodniceanu@proton.me>
+Date: Tue, 13 May 2025 18:16:08 +0300
+Subject: [PATCH 2/3] compiler/test/runnable/test23889.c: Use proper alloca
+ header
+
+With -std=c11, on linux, alloca no longer comes from stdlib.h.
+
+Also fix the URL bug number which never pointed to the right one.
+
+Signed-off-by: Andrei Horodniceanu <a.horodniceanu@proton.me>
+---
+ compiler/test/runnable/test23889.c | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/compiler/test/runnable/test23889.c b/compiler/test/runnable/test23889.c
+index 2648286d3d68..3dd71133b50e 100644
+--- a/compiler/test/runnable/test23889.c
++++ b/compiler/test/runnable/test23889.c
+@@ -1,8 +1,8 @@
+ // DISABLED: win freebsd openbsd
+ 
+-// https://issues.dlang.org/show_bug.cgi?id=23886
++// https://issues.dlang.org/show_bug.cgi?id=23889
+ 
+-#include <stdlib.h>
++#include <alloca.h>
+ 
+ int main()
+ {
+
+From d1aeeb75865285fe86ee62800c5f9f3f04831782 Mon Sep 17 00:00:00 2001
+From: Andrei Horodniceanu <a.horodniceanu@proton.me>
+Date: Mon, 12 May 2025 23:27:05 +0300
+Subject: [PATCH 3/3] dmd/link.d: Pass -std=c11 when invoking the preprocessor
+ on posix
+
+Don't rely on the default -std value since gcc/clang updates may lead
+to breakages. Additionally, the default value for both compiler
+vendors, on linux at least, is a gnu variant rather then the ISO
+standard.
+
+Closes: https://github.com/dlang/dmd/issues/21311
+Signed-off-by: Andrei Horodniceanu <a.horodniceanu@proton.me>
+---
+ compiler/src/dmd/link.d | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/compiler/src/dmd/link.d b/compiler/src/dmd/link.d
+index b93b9fd17db8..6cc0dba1217a 100644
+--- a/compiler/src/dmd/link.d
++++ b/compiler/src/dmd/link.d
+@@ -1149,6 +1149,8 @@ public int runPreprocessor(Loc loc, const(char)[] cpp, const(char)[] filename, c
+         Strings argv;
+         argv.push(cpp.xarraydup.ptr);       // null terminated copy
+ 
++        argv.push("-std=c11");
++
+         foreach (p; cppswitches)
+         {
+             if (p && p[0])
