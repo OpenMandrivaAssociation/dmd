@@ -8,7 +8,7 @@ Name:		dmd
 Version:	2.112.0_beta.1
 %define realver 2.112.0-beta.1
 %define docver 2.111.0
-Release:	1
+Release:	2
 License:	Boost
 Group:		Development/Tools
 URL:		https://dlang.org/
