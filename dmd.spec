@@ -5,19 +5,17 @@
 
 Summary:	D Programming Language compiler
 Name:		dmd
-Version:	2.112.0_beta.1
-%define realver 2.112.0-beta.1
-%define docver 2.111.0
-Release:	2
+Version:	2.112.0
+%define realver 2.112.0
+%define docver 2.112.0
+Release:	1
 License:	Boost
 Group:		Development/Tools
 URL:		https://dlang.org/
 Source0:	https://github.com/dlang/%{name}/archive/refs/tags/v%{realver}.tar.gz#/%{name}-%{realver}.tar.gz
 Source1:	https://github.com/dlang/phobos/archive/refs/tags/v%{realver}.tar.gz#/phobos-%{realver}.tar.gz
 Source2:	https://downloads.dlang.org/releases/2.x/%{docver}/dmd.%{docver}.linux.tar.xz
-Patch0:	21371.patch
-Patch1:	21372.patch
-Patch2:	no-gc-sections.patch
+Patch0:	no-gc-sections.patch
 %if %{with bootstrap_ldc}
 BuildRequires:	ldc
 %else
@@ -78,16 +76,15 @@ export HOST_DMD=%{_bindir}/dmd
 %endif
 
 %if %{with bootstrap_ldc}
-# XXX enable release mode later after figuring out the segfault
 DFLAGS=
 mkdir generated
-$HOST_DMD -ofgenerated/build -g compiler/src/build.d
-generated/build HOST_DMD="$HOST_DMD" CC=cc CXX=c++ DFLAGS="$DFLAGS" INSTALL_DIR=bootstrap install -v
+$HOST_DMD -ofgenerated/build -g compiler/src/build.d -release -O
+generated/build HOST_DMD="$HOST_DMD" CC=cc CXX=c++ BUILD=release ENABLE_RELEASE=1 DFLAGS="$DFLAGS" INSTALL_DIR=bootstrap install -v
 cd druntime
-make DMD=../generated/linux/release/%{bits}/dmd PIC=1
+make DMD=../generated/linux/release/%{bits}/dmd BUILD=release ENABLE_RELEASE=1 PIC=1
 make install INSTALL_DIR=../bootstrap
 cd ../../phobos
-make DMD=../%{name}/generated/linux/release/%{bits}/dmd PIC=1
+make DMD=../%{name}/generated/linux/release/%{bits}/dmd BUILD=release ENABLE_RELEASE=1 PIC=1
 make install INSTALL_DIR=../%{name}/bootstrap
 cd ../%{name}
 rm -rf generated
