@@ -1,4 +1,9 @@
-%bcond bootstrap_ldc	0
+# aarch64 has ldc and no previous dmd, so the host compiler has to be ldc.
+%ifarch aarch64
+%bcond bootstrap_ldc 1
+%else
+%bcond bootstrap_ldc 0
+%endif
 
 %define bits %{__isa_bits}
 %define phobos %mklibname phobos-dmd
