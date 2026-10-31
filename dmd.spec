@@ -5,9 +5,10 @@
 
 Summary:	D Programming Language compiler
 Name:		dmd
-Version:	2.112.1
-%define realver 2.112.0
-%define docver 2.112.0
+Version:	2.113.1
+%define realver 2.113.1
+# 2.113.1 has no dmd.<ver>.linux.tar.xz yet. HTML docs are the 2.113.0 reference.
+%define docver 2.113.0
 Release:	1
 License:	Boost
 Group:		Development/Tools
@@ -65,9 +66,9 @@ This package contains the documentation.
 %prep
 ln -s %{name}-%{realver} %{name}
 ln -s phobos-%{realver} phobos
-%setup -b2 -n dmd-2.112.0
-%setup -b1 -n dmd-2.112.0
-%autosetup -p1 -n dmd-2.112.0
+%setup -b2 -n dmd-%{realver}
+%setup -b1 -n dmd-%{realver}
+%autosetup -p1 -n dmd-%{realver}
 
 %build
 %if %{with bootstrap_ldc}
