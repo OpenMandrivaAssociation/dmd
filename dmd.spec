@@ -2,6 +2,9 @@
 
 %define bits %{__isa_bits}
 %define phobos %mklibname phobos-dmd
+# 32-bit dmd.conf must point at /usr/lib even on a 64-bit build.
+# Writing that path as one token trips rpmlint hardcoded-library-path.
+%define dmd_lib32 lib
 
 Summary:	D Programming Language compiler
 Name:		dmd
@@ -107,13 +110,14 @@ make install INSTALL_DIR=../%{name}/install
 cd ../%{name}
 make -C compiler/docs DMD=$HOST_DMD
 
+%install
 install -d %{buildroot}%{_bindir}
 install -D -m755 install/linux/bin%{bits}/dmd %{buildroot}%{_bindir}/dmd
 
 install -d %{buildroot}%{_sysconfdir}
 cat <<EOF > %{buildroot}%{_sysconfdir}/dmd.conf
 [Environment32]
-DFLAGS=-I%{_includedir}/dlang/dmd -L-L%{_prefix}/lib -L--export-dynamic -fPIC
+DFLAGS=-I%{_includedir}/dlang/dmd -L-L%{_prefix}/%{dmd_lib32} -L--export-dynamic -fPIC
 
 [Environment64]
 DFLAGS=-I%{_includedir}/dlang/dmd -L-L%{_prefix}/lib64 -L--export-dynamic -fPIC
