@@ -18,7 +18,7 @@ diff -ruN dmd-2.113.1/compiler/src/dmd/argtypes_aarch64.d dmd-2.113.1/compiler/s
      }
 diff -ruN dmd-2.113.1/compiler/src/dmd/backend/arm/cod1.d dmd-2.113.1/compiler/src/dmd/backend/arm/cod1.d
 --- dmd-2.113.1/compiler/src/dmd/backend/arm/cod1.d	2026-10-31 15:30:53.000000000 +0100
-+++ dmd-2.113.1/compiler/src/dmd/backend/arm/cod1.d	2026-11-02 09:51:40.879761642 +0100
++++ dmd-2.113.1/compiler/src/dmd/backend/arm/cod1.d	2026-11-02 23:01:45.153319432 +0100
 @@ -35,7 +35,7 @@
  import dmd.backend.rtlsym;
  import dmd.backend.ty;
@@ -413,6 +413,18 @@ diff -ruN dmd-2.113.1/compiler/src/dmd/backend/arm/cod1.d dmd-2.113.1/compiler/s
          // See if we can use register that parameter was passed in
          //printf("xyzzy1 %s %d %d\n", e.Vsym.Sident.ptr, cast(int)cgstate.regcon.params, regParamInPreg(e.Vsym));
          if (cgstate.regcon.params &&
+@@ -2620,7 +2806,10 @@
+             !cgstate.anyiasm &&   // may have written to the memory for the parameter
+             (cgstate.regcon.params & mask(e.Vsym.Spreg) && e.Voffset == 0 ||
+              cgstate.regcon.params & mask(e.Vsym.Spreg2) && e.Voffset == REGSIZE) &&
+-            sz <= REGSIZE)                  // make sure no 'paint' to a larger size happened
++            sz <= REGSIZE &&                 // make sure no 'paint' to a larger size happened
++            // A byte-sized use of a wider parameter still has the high
++            // bits set. Fall through so the load masks with AND #0xFF.
++            !(sz == 1 && tysize(e.Vsym.ty()) > 1))
+         {
+             const reg_t preg = e.Voffset ? e.Vsym.Spreg2 : e.Vsym.Spreg;
+             const regm_t pregm = mask(preg);
 diff -ruN dmd-2.113.1/compiler/src/dmd/backend/arm/cod2.d dmd-2.113.1/compiler/src/dmd/backend/arm/cod2.d
 --- dmd-2.113.1/compiler/src/dmd/backend/arm/cod2.d
 +++ dmd-2.113.1/compiler/src/dmd/backend/arm/cod2.d
@@ -1224,7 +1236,7 @@ diff -ruN dmd-2.113.1/compiler/src/dmd/backend/arm/cod3.d dmd-2.113.1/compiler/s
                  default:
 diff -ruN dmd-2.113.1/compiler/src/dmd/backend/arm/cod4.d dmd-2.113.1/compiler/src/dmd/backend/arm/cod4.d
 --- dmd-2.113.1/compiler/src/dmd/backend/arm/cod4.d	2026-10-31 15:30:53.000000000 +0100
-+++ dmd-2.113.1/compiler/src/dmd/backend/arm/cod4.d	2026-11-02 10:50:12.294643954 +0100
++++ dmd-2.113.1/compiler/src/dmd/backend/arm/cod4.d	2026-11-02 22:09:24.472763745 +0100
 @@ -43,7 +43,7 @@
  import dmd.backend.x86.xmm;
  import dmd.backend.arm.cod1 : getlvalue, loadFromEA, storeToEA,CLIB_A,callclib;
@@ -1234,7 +1246,7 @@ diff -ruN dmd-2.113.1/compiler/src/dmd/backend/arm/cod4.d dmd-2.113.1/compiler/s
  import dmd.backend.arm.instr;
  
  
-@@ -134,7 +134,9 @@
+@@ -134,9 +134,14 @@
              // If loading result into a register
              if (cs.reg != NOREG)
              {
@@ -1243,9 +1255,15 @@ diff -ruN dmd-2.113.1/compiler/src/dmd/backend/arm/cod4.d dmd-2.113.1/compiler/s
 +                // passing the number leaves the parameter register live.
 +                getregs(cdb, mask(cs.reg));
                  const p = cast(targ_size_t*) &(e2.EV);
-                 movregconst(cdb,cs.reg,*p,sz == 8);
+-                movregconst(cdb,cs.reg,*p,sz == 8);
++                // 64 means a 64-bit immediate. `sz == 8` is 0 or 1, and
++                // movregconst then keeps only the low 32 bits, so 1UL<<63
++                // becomes 0 and matches a register that already holds 0.
++                movregconst(cdb,cs.reg,*p,(sz == 8) ? 64 : 0);
              }
-@@ -234,14 +236,25 @@
+             else
+             {
+@@ -234,14 +239,25 @@
          // do the MSW
          cs.Iop = IopSave;
          reg_t mswreg = findreg(retregs & INSTR.MSW);
@@ -1276,7 +1294,7 @@ diff -ruN dmd-2.113.1/compiler/src/dmd/backend/arm/cod4.d dmd-2.113.1/compiler/s
  
      if (e1.Ecount ||                    // if lvalue is a CSE or
          regvar)                         // rvalue can't be a CSE
-@@ -269,6 +282,7 @@
+@@ -269,6 +285,7 @@
          assert(imm12 < 0x1000);  // should use movregconst() if this assert trips
          uint ins = INSTR.addsub_imm(sz == 8,0,op,sh,postinc,ireg,ireg); // ADD/SUB ireg,ireg,imm12,shift
          cdb.gen1(ins);
@@ -1284,7 +1302,7 @@ diff -ruN dmd-2.113.1/compiler/src/dmd/backend/arm/cod4.d dmd-2.113.1/compiler/s
      }
      freenode(e1);
  }
-@@ -424,7 +438,11 @@
+@@ -424,7 +441,11 @@
          uint imm3 = 0;                // shift amount
          uint S = forccs != 0;
          uint opt = 0;
@@ -1296,7 +1314,7 @@ diff -ruN dmd-2.113.1/compiler/src/dmd/backend/arm/cod4.d dmd-2.113.1/compiler/s
          reg_t Rm = reg2;
          reg_t Rn = reg1;
          reg_t Rd = reg1;
-@@ -710,7 +728,11 @@
+@@ -710,7 +731,11 @@
          }
          regm_t idxregs = idxregm(cs);  // save index registers so we can do the storeToEA() later
          regm_t dummy;
@@ -1309,7 +1327,7 @@ diff -ruN dmd-2.113.1/compiler/src/dmd/backend/arm/cod4.d dmd-2.113.1/compiler/s
      }
      else
      {
-@@ -1147,7 +1169,7 @@
+@@ -1147,7 +1172,7 @@
                  rreg = findreg(rretregs & INSTR.MSW);
                  uint ins = INSTR.cmp_subs_addsub_shift(1, rreg, 0, 0, reg); // CMP reg, rreg
                  cdb.gen1(ins);
@@ -1318,7 +1336,7 @@ diff -ruN dmd-2.113.1/compiler/src/dmd/backend/arm/cod4.d dmd-2.113.1/compiler/s
  
                  reg = findreg(retregs & INSTR.LSW);
                  rreg = findreg(rretregs & INSTR.LSW);
-@@ -1565,10 +1587,10 @@
+@@ -1565,10 +1590,10 @@
      {
          case OPd_s16:                               // fcvtzs w0,d31  // sxth w0,w0
          case OPd_s32: ftype = 1; sf = 0; goto L2;   // fcvtzs w0,d31
@@ -1331,7 +1349,7 @@ diff -ruN dmd-2.113.1/compiler/src/dmd/backend/arm/cod4.d dmd-2.113.1/compiler/s
          L2:
              regm_t retregs1 = INSTR.FLOATREGS;
              codelem(cgstate,cdb,e.E1,retregs1,false);
-@@ -1590,21 +1612,22 @@
+@@ -1590,21 +1615,22 @@
                      cdb.gen1(INSTR.fcvtzs(0,1,V1,Rd));                  // fcvtzs Rd,V1
                      break;
                  case OPd_s64:
@@ -1359,7 +1377,7 @@ diff -ruN dmd-2.113.1/compiler/src/dmd/backend/arm/cod4.d dmd-2.113.1/compiler/s
                      break;
                  default:
                      assert(0);
-@@ -1642,7 +1665,8 @@
+@@ -1642,7 +1668,8 @@
                  case OPu16_d:
                      /* not executed because OPu16_d was converted to OPu16_32 then OP32_d */
                      uint N,immr,imms;
@@ -1369,7 +1387,7 @@ diff -ruN dmd-2.113.1/compiler/src/dmd/backend/arm/cod4.d dmd-2.113.1/compiler/s
                      cdb.gen1(INSTR.log_imm(0,0,0,immr,imms,Rn,Rn)); // and w0,w0,#0xFFFF
                      cdb.gen1(INSTR.ucvtf_float_int(0,1,Rn,Vd));     // ucvtf d31,w0
                      break;
-@@ -1696,6 +1720,12 @@
+@@ -1696,6 +1723,12 @@
              callclib(cdb,e,clib,pretregs,0);
              break;
  
@@ -1382,7 +1400,7 @@ diff -ruN dmd-2.113.1/compiler/src/dmd/backend/arm/cod4.d dmd-2.113.1/compiler/s
          default:
              assert(0);
      }
-@@ -1748,7 +1778,10 @@
+@@ -1748,7 +1781,10 @@
              Extend extend = e1.Eoper == OPu8_16 ? Extend.UXTB : Extend.UXTH;
              cs.Sextend = cast(ubyte)((cs.Sextend & 8) | extend);  // preserve S bit
              reg_t reg = allocreg(cdb,retregs,TYint);
@@ -1394,7 +1412,7 @@ diff -ruN dmd-2.113.1/compiler/src/dmd/backend/arm/cod4.d dmd-2.113.1/compiler/s
              cdb.gen(&cs);
              freenode(e1.E1);
              freenode(e1);
-@@ -1784,7 +1817,8 @@
+@@ -1784,7 +1820,8 @@
          Extend extend = e1.Eoper == OPs8_16 ? Extend.SXTB : Extend.SXTH;
          cs.Sextend = cast(ubyte)((cs.Sextend & 8) | extend);  // preserve S bit
          reg_t reg = allocreg(cdb,retregs,TYint);
@@ -1404,7 +1422,7 @@ diff -ruN dmd-2.113.1/compiler/src/dmd/backend/arm/cod4.d dmd-2.113.1/compiler/s
          cdb.gen(&cs);
          freenode(e1.E1);
          freenode(e1);
-@@ -1821,8 +1855,11 @@
+@@ -1821,8 +1858,11 @@
              {
                  //    INSTR.log_imm(sf,opc,N,immr,imms,Rn,Rd)
                  uint N,immr,imms;
@@ -1418,7 +1436,7 @@ diff -ruN dmd-2.113.1/compiler/src/dmd/backend/arm/cod4.d dmd-2.113.1/compiler/s
                  cdb.gen1(ins);
              }
              else
-@@ -1863,7 +1900,8 @@
+@@ -1863,7 +1903,8 @@
                      if (cs.reg != NOREG)
                      {
                          uint N,immr,imms;
@@ -1428,7 +1446,7 @@ diff -ruN dmd-2.113.1/compiler/src/dmd/backend/arm/cod4.d dmd-2.113.1/compiler/s
                          uint ins = INSTR.log_imm(0,0,0,immr,imms,cs.reg,reg); // AND Xreg,Xcsreg,#0xFFFF
                          cdb.gen1(ins);
                      }
-@@ -1904,7 +1942,8 @@
+@@ -1904,7 +1945,8 @@
              if (op == OPu16_32)
              {
                  uint N,immr,imms;
@@ -1438,7 +1456,7 @@ diff -ruN dmd-2.113.1/compiler/src/dmd/backend/arm/cod4.d dmd-2.113.1/compiler/s
                  uint ins = INSTR.log_imm(0,0,0,immr,imms,reg,reg); // AND reg,reg,#0xFFFF
                  cdb.gen1(ins);
              }
-@@ -2040,7 +2079,8 @@
+@@ -2040,7 +2082,8 @@
          else
          {
              uint N,immr,imms;
@@ -1500,7 +1518,7 @@ diff -ruN dmd-2.113.1/compiler/src/dmd/backend/arm/instr.d dmd-2.113.1/compiler/
  {
 diff -ruN dmd-2.113.1/compiler/src/dmd/backend/cgelem.d dmd-2.113.1/compiler/src/dmd/backend/cgelem.d
 --- dmd-2.113.1/compiler/src/dmd/backend/cgelem.d	2026-10-31 15:30:53.000000000 +0100
-+++ dmd-2.113.1/compiler/src/dmd/backend/cgelem.d	2026-11-02 17:23:55.872944502 +0100
++++ dmd-2.113.1/compiler/src/dmd/backend/cgelem.d	2026-11-02 23:02:01.637487215 +0100
 @@ -3655,6 +3655,19 @@
                  goto L1;
              goto Ldefault;
@@ -1545,6 +1563,63 @@ diff -ruN dmd-2.113.1/compiler/src/dmd/backend/cgelem.d dmd-2.113.1/compiler/src
                      else if (0 && cgstate.AArch64)
                          goto Ldefault;
                      else
+@@ -4486,8 +4511,10 @@
+         tym_t tym;
+         int sz = tysize(e2.Ety);
+ 
+-        /* The AArch64 does not have a compare short instruction, so the comparisons
+-         * have to be done with the LDRH, etc., instructions
++        /* AArch64 CMP reads every bit of the register. An x86 byte or
++         * word compare does not. Deleting the extension and comparing the
++         * raw value treats a const struct (TYstruct|mTYconst == 0x126)
++         * as not a struct.
+          */
+         if (config.target_cpu != TARGET_AArch64)
+         {
+@@ -4502,9 +4529,13 @@
+         }
+ 
+         /* Try to convert to byte/word comparison for ((x & c)==d)
+-           when mask c essentially casts x to a smaller type
++           when mask c essentially casts x to a smaller type.
++           Not on AArch64: the rewritten compare is a 32-bit CMP of the
++           unmasked value, so tybasic() of a const struct (0x126) is not
++           TYstruct (0x26).
+          */
+         if (OPTIMIZER &&
++            config.target_cpu != TARGET_AArch64 &&
+             e1.Eoper == OPand &&
+             e1.E2.Eoper == OPconst &&
+             sz > CHARSIZE)
+@@ -4581,9 +4612,10 @@
+             goto ret;
+         }
+ 
+-        if (e1.Eoper == OPu8_16 && e2.Vuns < 256 ||
++        if (config.target_cpu != TARGET_AArch64 &&
++            (e1.Eoper == OPu8_16 && e2.Vuns < 256 ||
+             e1.Eoper == OPs8_16 &&
+-            e2.Vint == cast(targ_schar) e2.Vint)
++            e2.Vint == cast(targ_schar) e2.Vint))
+         {
+             tym = (uns || e1.Eoper == OPu8_16) ? TYuchar : TYschar;
+             e.E2 = el_una(OP16_8,tym,e2);
+@@ -4680,13 +4712,13 @@
+              e = optelem(e, Goal.value);
+         }
+     }
+-    else if ((
++    else if (config.target_cpu != TARGET_AArch64 && ((
+              (e1.Eoper == OPu8_16 ||
+               e1.Eoper == OPs8_16)||
+              (e1.Eoper == OPu16_32 ||
+               e1.Eoper == OPs16_32)
+              ) &&
+-             e1.Eoper == e2.Eoper)
++             e1.Eoper == e2.Eoper))
+     {
+         if (uns)
+         {
 diff -ruN dmd-2.113.1/compiler/src/dmd/backend/cgen.d dmd-2.113.1/compiler/src/dmd/backend/cgen.d
 --- dmd-2.113.1/compiler/src/dmd/backend/cgen.d	2026-10-31 15:30:53.000000000 +0100
 +++ dmd-2.113.1/compiler/src/dmd/backend/cgen.d	2026-11-02 08:18:32.984992867 +0100
@@ -1932,8 +2007,59 @@ diff -ruN dmd-2.113.1/compiler/src/dmd/backend/elpicpie.d dmd-2.113.1/compiler/s
                       * This is so we can preserve the magic sequence of instructions
 diff -ruN dmd-2.113.1/compiler/src/dmd/backend/x86/cgcod.d dmd-2.113.1/compiler/src/dmd/backend/x86/cgcod.d
 --- dmd-2.113.1/compiler/src/dmd/backend/x86/cgcod.d	2026-10-31 15:30:53.000000000 +0100
-+++ dmd-2.113.1/compiler/src/dmd/backend/x86/cgcod.d	2026-11-02 08:51:34.514468773 +0100
-@@ -969,6 +969,10 @@
++++ dmd-2.113.1/compiler/src/dmd/backend/x86/cgcod.d	2026-11-02 23:27:21.122773588 +0100
+@@ -102,6 +102,10 @@
+      * loop until no more registers are free'd up.
+      */
+     cgstate.pass = BackendPass.initial;
++    // x29 is the frame pointer. A previous function may have claimed it as a
++    // GPR. Drop it here so a function that BLs can keep x29 for the saved x30.
++    if (cgstate.AArch64)
++        cgstate.allregs &= ~mask(cgstate.BP);
+     while (1)
+     {
+         debug
+@@ -226,8 +230,13 @@
+             break;
+         }
+ 
+-        // See which variables we can put into registers
+-        cgstate.allregs |= cod3_useBP();                // use EBP as general purpose register
++        // See which variables we can put into registers.
++        // A BL clobbers x30. The next pass must leave x29 free so the
++        // prologue can use it to save the link register.
++        if (cgstate.AArch64 && cgstate.calledafunc)
++            cgstate.allregs &= ~mask(cgstate.BP);
++        else
++            cgstate.allregs |= cod3_useBP();                // use EBP as general purpose register
+ 
+         // If pic code, but EBX was never needed
+         if (!(cgstate.allregs & mask(PICREG)) && !cgstate.gotref)
+@@ -644,7 +653,11 @@
+         !(config.exe == EX_WIN32) && !(funcsym_p.Sfunc.Fflags3 & Fnothrow) ||
+         cg.accessedTLS ||
+         sv64 ||
+-        (0 && cg.calledafunc && cg.AArch64)
++        // BL writes x30 and does not push a return address. Libcalls
++        // (__extenddftf2 and the other *tf2 helpers) leave the function
++        // marked nothrow, so the throw check above does not allocate a
++        // frame, and `ret` comes back to the instruction after the BL.
++        (cg.calledafunc && cg.AArch64)
+        )
+     {
+         //printf("0 prolog() needframe %d alwaysframe %d\n", cg.needframe, config.flags & CFGalwaysframe);
+@@ -866,6 +879,10 @@
+         if (sz & (STACKALIGN - 1))
+             localsize += STACKALIGN - (sz & (STACKALIGN - 1));
+     }
++    // The saved x29/x30 pair is 16 bytes. localsize has to be a multiple
++    // of 16 so the pre-indexed STP keeps SP 16-byte aligned.
++    if (cg.AArch64 && cg.needframe && (localsize & 15))
++        localsize = (localsize + 15) & ~15;
+     cg.funcarg.offset = -localsize;
+ 
+     static if (0)
+@@ -969,6 +986,10 @@
      {
          assert(I32 || I64);
          prolog_frameadj2(cg, cdbx, tyf, xlocalsize, &pushalloc);
@@ -1944,7 +2070,7 @@ diff -ruN dmd-2.113.1/compiler/src/dmd/backend/x86/cgcod.d dmd-2.113.1/compiler/
          version (FRAMEPTR) { } else
              cg.BPoff += REGSIZE;
      }
-@@ -2833,10 +2837,12 @@
+@@ -2833,10 +2854,12 @@
                  /* if no return value       */
                  if (cg.AArch64)
                  {
