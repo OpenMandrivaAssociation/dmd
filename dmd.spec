@@ -25,6 +25,7 @@ Source0:	https://github.com/dlang/%{name}/archive/refs/tags/v%{realver}.tar.gz#/
 Source1:	https://github.com/dlang/phobos/archive/refs/tags/v%{realver}.tar.gz#/phobos-%{realver}.tar.gz
 Source2:	https://downloads.dlang.org/releases/2.x/%{docver}/dmd.%{docver}.linux.tar.xz
 Patch0:	no-gc-sections.patch
+Patch1:	dmd-2.113.1-aarch64.patch
 BuildRequires:	make
 %if %{with bootstrap_ldc}
 BuildRequires:	ldc

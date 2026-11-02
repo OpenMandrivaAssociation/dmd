@@ -1,0 +1,2606 @@
+diff -ruN dmd-2.113.1/compiler/src/dmd/argtypes_aarch64.d dmd-2.113.1/compiler/src/dmd/argtypes_aarch64.d
+--- dmd-2.113.1/compiler/src/dmd/argtypes_aarch64.d	2026-10-31 15:30:53.000000000 +0100
++++ dmd-2.113.1/compiler/src/dmd/argtypes_aarch64.d	2026-11-02 03:43:32.874520482 +0100
+@@ -56,6 +56,14 @@
+ 
+     if (isHFVA)
+     {
++        /* The backend names only two return/argument registers. An HFVA of
++         * three or four elements would be truncated, so pass it in memory.
++         * Caller and callee both see the empty tuple. AAPCS64 itself allows
++         * four SIMD registers; that needs v2/v3 in the code generator.
++         */
++        auto tsa = hfvaType.isTypeSArray();
++        if (tsa && tsa.dim.toUInteger() > 2)
++            return TypeTuple.empty;
+         // pass in SIMD registers
+         return new TypeTuple(hfvaType);
+     }
+diff -ruN dmd-2.113.1/compiler/src/dmd/backend/arm/cod1.d dmd-2.113.1/compiler/src/dmd/backend/arm/cod1.d
+--- dmd-2.113.1/compiler/src/dmd/backend/arm/cod1.d	2026-10-31 15:30:53.000000000 +0100
++++ dmd-2.113.1/compiler/src/dmd/backend/arm/cod1.d	2026-11-02 07:11:32.557846845 +0100
+@@ -35,7 +35,7 @@
+ import dmd.backend.rtlsym;
+ import dmd.backend.ty;
+ import dmd.backend.type;
+-import dmd.backend.arm.cod2 : tyToExtend;
++import dmd.backend.arm.cod2 : tyToExtend, getoffset;
+ import dmd.backend.arm.cod3 : COND, genBranch, conditionCode, gentstreg;
+ import dmd.backend.arm.instr;
+ import dmd.backend.arm.cod3 : loadFloatRegConst;
+@@ -122,8 +122,10 @@
+         {
+             with (Extend) final switch (cs.Sextend & 7)
+             {
+-                case UXTB:      cs.Iop = INSTR.log_imm(sf,0,0,0,0x7,cs.reg,reg); break; // AND sf,x0,x0,#0xFF
+-                case UXTH:      cs.Iop = INSTR.log_imm(sf,0,0,0,0xF,cs.reg,reg); break; // AND sf,x0,x0,#0xFFFF
++                // N must match sf. N=0,imms=7 is #0xff in a W register
++                // and #0xff000000ff in an X register.
++                case UXTB:      cs.Iop = INSTR.log_imm(sf,0,sf,0,0x7,cs.reg,reg); break; // AND sf,x0,x0,#0xFF
++                case UXTH:      cs.Iop = INSTR.log_imm(sf,0,sf,0,0xF,cs.reg,reg); break; // AND sf,x0,x0,#0xFFFF
+                 case SXTB:      cs.Iop = INSTR.sxtb_sbfm(sf,cs.reg,reg);         break; // SXTB sf,x0,w0
+                 case SXTH:      cs.Iop = INSTR.sxth_sbfm(sf,cs.reg,reg);         break; // SXTH sf,x0,w0
+                 case SXTW:      cs.Iop = INSTR.sxtw_sbfm(cs.reg,reg);            break; // SXTW sf,x0,w0
+@@ -182,7 +184,7 @@
+         return cs.Iop;
+     }
+ 
+-    assert(test(Extend.UXTB, 0, 0, 8, 1) == 0x92001C00); // AND x0,x0,#0xFF
++    assert(test(Extend.UXTB, 0, 0, 8, 1) == 0x92401C00); // AND x0,x0,#0xFF
+     assert(test(Extend.UXTH, 0, 0, 8, 2) == 0x92003C00); // AND x0,x0,#0xFFFF
+     assert(test(Extend.UXTW, 0, 0, 4, 2) == 0x2A0003E0); // MOV w0,w0
+ }
+@@ -1187,10 +1189,35 @@
+                  * the opcode. The only way to deal with this is to prevent enregistering
+                  * such variables.
+                  */
++                const bool floatInInt = tyfloating(ty) && !(s.Sregm & INSTR.FLOATREGS);
++                const bool intInFloat = !tyfloating(ty) && (s.Sregm & INSTR.FLOATREGS);
+                 if (tyxmmreg(ty) && !(s.Sregm & XMMREGS) ||
+-                    !tyxmmreg(ty) && (s.Sregm & XMMREGS))       // TODO AArch64
++                    !tyxmmreg(ty) && (s.Sregm & XMMREGS) ||
++                    floatInInt || intInFloat)
+                     cgreg_unregister(s.Sregm);
+ 
++                /* A 16-byte real in a GPR cannot be FMOV'd into a Q register.
++                 * Unregister it and address the stack slot. cgreg_assign redoes
++                 * this function, so the slot exists on the pass that is emitted.
++                 */
++                if (floatInInt || intInFloat)
++                {
++                    pcs.reg = NOREG;
++                    pcs.base = BP;
++                    pcs.index = NOREG;
++                    if (s.Sclass == SC.parameter || s.Sclass == SC.shadowreg || s.Sclass == SC.regpar)
++                        pcs.IFL1 = FL.para;
++                    else if (s.Sclass == SC.fastpar)
++                        pcs.IFL1 = FL.fast;
++                    else if (s.Sclass == SC.bprel)
++                        pcs.IFL1 = FL.bprel;
++                    else
++                        pcs.IFL1 = FL.auto_;
++                    pcs.IEV1.Vsym = s;
++                    pcs.IEV1.Voffset = e.Voffset;
++                    break;
++                }
++
+                 if (
+                     s.Sclass == SC.regpar ||
+                     s.Sclass == SC.parameter)
+@@ -1209,10 +1236,31 @@
+ 
+                 break;
+             }
+-            if (config.flags3 & CFG3pic &&
+-                (fl == FL.tlsdata || s.ty() & mTYthread))
+-            {
+-                assert(0);
++            /* x29 is the frame pointer. It is not a stand-in for a
++             * linker-resolved address. Globals, externs, TLS and code
++             * addresses are materialized by getoffset (ADRP+ADD, GOT, or
++             * initial-exec). The load/store then uses that register.
++             * loadea() may add a further byte offset for the high half of
++             * a pair; FL.offset asks assignaddrc to fold it into the imm12.
++             */
++            const bool absAddr =
++                fl == FL.data || fl == FL.udata || fl == FL.csdata ||
++                fl == FL.extern_ || fl == FL.tlsdata || fl == FL.func ||
++                fl == FL.got || fl == FL.gotoff ||
++                (s.ty() & mTYthread) != 0;
++            if (absAddr)
++            {
++                regm_t aregs = INSTR.ALLREGS & ~keepmsk;
++                reg_t areg = allocreg(cdb, aregs, TYnptr);
++                getoffset(cgstate, cdb, e, areg);
++                pcs.base = areg;
++                pcs.index = NOREG;
++                pcs.reg = NOREG;
++                pcs.IFL1 = FL.offset;
++                pcs.IEV1.Voffset = 0;
++                if (!tyfloating(ty))
++                    pcs.Sextend = cast(ubyte)tyToExtend(ty);
++                break;
+             }
+             pcs.IEV1.Vsym = s;
+             pcs.IEV1.Voffset = e.Voffset;
+@@ -1415,10 +1463,20 @@
+             // should fix genmovreg() to do this work
+             if (tyfloating(tym))
+             {
+-                const uint ftype = INSTR.szToFtype(sz);
+                 assert((msreg & lsreg & msrreg & lsrreg) & 32);      // ensure all fp registers
+-                cdb.gen1(INSTR.fmov(ftype,msreg,msrreg));            // FMOV msrreg,msreg
+-                cdb.gen1(INSTR.fmov(ftype,lsreg,lsrreg));            // FMOV lsrreg,lsreg
++                // Each half of a creal is a 128-bit real. Scalar FMOV has no
++                // quad form; szToFtype(16) is half and would keep 16 bits.
++                if (sz == 16)
++                {
++                    cdb.gen1(INSTR.mov_orr_advsimd_reg(1,msreg,msrreg)); // MOV msrreg.16b,msreg.16b
++                    cdb.gen1(INSTR.mov_orr_advsimd_reg(1,lsreg,lsrreg)); // MOV lsrreg.16b,lsreg.16b
++                }
++                else
++                {
++                    const uint ftype = INSTR.szToFtype(sz);
++                    cdb.gen1(INSTR.fmov(ftype,msreg,msrreg));        // FMOV msrreg,msreg
++                    cdb.gen1(INSTR.fmov(ftype,lsreg,lsrreg));        // FMOV lsrreg,lsreg
++                }
+             }
+             else
+             {
+@@ -1433,13 +1491,22 @@
+             reg_t Vn = findreg(retregs);
+             reg_t Vd = allocreg(cdb, outretregs, tym);  // allocate return regs
+             //printf("Vn: %d Vd: %d\n", Vn, Vd);
+-            uint ftype = INSTR.szToFtype(sz);
+             if (Vn < 32) // move integer to float
+             {
++                // FMOV Vd,Rn copies 32 or 64 bits. A real does not fit in a GPR.
++                assert(sz == 4 || sz == 8);
++                uint ftype = INSTR.szToFtype(sz);
+                 cdb.gen1(INSTR.fmov_float_gen(1,ftype,0,7,Vn,Vd));   // FMOV Vd,Rn https://www.scs.stanford.edu/~zyedidia/arm64/fmov_float_gen.html
+             }
++            else if (sz == 16) // move quad to quad
++            {
++                // Scalar FMOV has no 128-bit ftype. szToFtype(16) is half,
++                // so FMOV Hd,Hn keeps 16 bits of the real and the cast sees 0.
++                cdb.gen1(INSTR.mov_orr_advsimd_reg(1,Vn,Vd)); // MOV Vd.16b,Vn.16b
++            }
+             else // move float to float
+             {
++                uint ftype = INSTR.szToFtype(sz);
+                 cdb.gen1(INSTR.fmov(ftype,Vn,Vd));  // FMOV Vd,Vn
+             }
+         }
+@@ -1468,6 +1535,7 @@
+ {
+     realToDouble,
+     doubleToReal,
++    realToU64,
+     add,
+     min,
+     mul,
+@@ -1554,6 +1622,15 @@
+             break;
+         }
+ 
++        case CLIB_A.realToU64:
++        {
++            // unsigned long __fixunstfdi(long double) — arg in q0, result in x0
++            string name = "__fixunstfdi";
++            s = symboly(name, mask(0));
++            cinfo.retregs = mask(0);
++            break;
++        }
++
+         case CLIB_A.add:
+         {
+             string name = "__addtf3";
+@@ -1645,8 +1722,65 @@
+  *      keepmask = mask of registers not to destroy. Saves/restores them
+  */
+ 
++/* MOV Vd.16B, Vn.16B. Scalar FMOV cannot copy a 128-bit real. */
++@trusted
++private void moveQuad(ref CodeBuilder cdb, reg_t to, reg_t from)
++{
++    if (to != from)
++        cdb.gen1(INSTR.mov_orr_advsimd_reg(1, from, to));
++}
++
++/********************************
++ * Place 128-bit float arguments in the AAPCS registers.
++ * __addtf3/__subtf3/__multf3/__divtf3 take the left operand in v0 and the
++ * right in v1. src1 == NOREG is a unary call (argument in v0 only).
++ * v0 and v1 are caller-saved, so this must run after getregs() has spilled
++ * anything still live there and before the BL.
++ */
++@trusted
++private void placeQuadArgs(ref CodeBuilder cdb, reg_t src0, reg_t src1)
++{
++    enum v0 = 32;
++    enum v1 = 33;
++    if (src1 == NOREG)
++    {
++        moveQuad(cdb, v0, src0);
++        return;
++    }
++
++    // left in v1 and right in v0: neither can be moved without a temporary.
++    if (src0 == v1 && src1 == v0)
++    {
++        regm_t tmpm = INSTR.FLOATREGS & ~mask(v0) & ~mask(v1);
++        reg_t tmp = allocreg(cdb, tmpm, TYreal);
++        moveQuad(cdb, tmp, v0);
++        moveQuad(cdb, v0, v1);
++        moveQuad(cdb, v1, tmp);
++        return;
++    }
++
++    bool leftInV0 = src0 == v0;
++    bool rightInV1 = src1 == v1;
++    // Evacuate a value that occupies the other argument's register first.
++    if (src1 == v0)
++    {
++        moveQuad(cdb, v1, src1);
++        rightInV1 = true;
++    }
++    if (src0 == v1)
++    {
++        moveQuad(cdb, v0, src0);
++        leftInV0 = true;
++    }
++    if (!leftInV0)
++        moveQuad(cdb, v0, src0);
++    if (!rightInV1)
++        moveQuad(cdb, v1, src1);
++}
++
+ @trusted
+-void callclib(ref CodeBuilder cdb, elem* e, uint clib, ref regm_t pretregs, regm_t keepmask)
++void callclib(ref CodeBuilder cdb, elem* e, uint clib, ref regm_t pretregs, regm_t keepmask,
++              reg_t src0 = NOREG, reg_t src1 = NOREG)
+ {
+     //printf("callclib(e = %p, clib = %d, pretregs = %s, keepmask = %s\n", e, clib, regm_str(pretregs), regm_str(keepmask));
+     //elem_print(e);
+@@ -1673,7 +1807,15 @@
+         }
+     }
+ 
++    // Quad libcalls do not take the registers codelem happened to choose.
++    if (src0 != NOREG)
++        placeQuadArgs(cdb, src0, src1);
++
+     cdb.gencs1(INSTR.branch_imm(1,0),0,FL.func,s);  // CALL s
++    // A BL reloc is CALL26 only when CFselfrel is set. Without it the
++    // linker records ADR_PREL against an external (memset, __addtf3, ...),
++    // which cannot be used in a shared object.
++    code_orflag(cdb.last(), CFselfrel | CFoff);
+     if (nalign)
+         cod3_stackadj(cdb, -nalign);
+     cgstate.calledafunc = 1;
+@@ -1827,6 +1969,14 @@
+         if (alignsize > STACKALIGN)
+             alignsize = STACKALIGN;         // no point if the stack is less aligned
+ 
++        /* AAPCS64 puts every stack argument in a slot of at least 8 bytes
++         * and rounds the size up to a multiple of 8. A 4-byte argument
++         * otherwise leaves numpara not register-aligned.
++         * OSX varies (sizeOnStack); leave that path alone.
++         */
++        if (!osx_aapcs64 && alignsize < REGSIZE)
++            alignsize = REGSIZE;
++
+         /* Alignment on OSX64 AArch64 is the same as for struct fields.
+          * If it is a variadic function, the last parameter (lastPar) is aligned on 8 bytes.
+          * Match behavior in backend.arm.cod1.cdfunc()
+@@ -1838,7 +1988,10 @@
+ 
+         p.offset = numpara;
+         //printf("[%d] param offset =  x%x, alignsize = %d\n", i, cast(int) numpara, cast(int) alignsize);
+-        numpara += sz;
++        if (!osx_aapcs64)
++            numpara += (sz + (REGSIZE - 1)) & ~(REGSIZE - 1);
++        else
++            numpara += sz;
+     }
+ 
+     //printf("numpara: %d STACKALIGN: %d\n", numpara, STACKALIGN);
+@@ -2168,12 +2321,18 @@
+         {
+             s = getRtlsym(RTLSYM.ALLOCA);
+             makeitextern(s);
+-            reg_t areg = CX;
+-            if (config.exe == EX_WIN64)
+-                areg = DX;
+-            getregs(cdbe, mask(areg));
+-            cdbe.genc(LEA, modregrm(2, areg, BPRM), FL.allocatmp, 0, FL.unde, 0);  // LEA areg,&localsize[BP]
+-            cgstate.Alloca.size = REGSIZE;
++            // AArch64 rt.alloca.__alloca is malloc(nbytes). The x86 LEA of the
++            // locals-size slot is not an AArch64 instruction; assignaddrc
++            // cannot relocate it. nbytes is already in x0.
++            if (!cgstate.AArch64)
++            {
++                reg_t areg = CX;
++                if (config.exe == EX_WIN64)
++                    areg = DX;
++                getregs(cdbe, mask(areg));
++                cdbe.genc(LEA, modregrm(2, areg, BPRM), FL.allocatmp, 0, FL.unde, 0);  // LEA areg,&localsize[BP]
++                cgstate.Alloca.size = REGSIZE;
++            }
+         }
+         if (sytab[s.Sclass] & SCSS)    // if function is on stack (!)
+         {
+@@ -2613,6 +2772,16 @@
+     }
+     else
+     {
++        // A function symbol used as a value is its address, not the
++        // bytes of the function. getoffset emits ADRP+GOT / ADRP+ADD.
++        if (e.Eoper == OPvar && e.Vsym &&
++            (tyfunc(e.Vsym.ty()) || e.Vsym.Sfl == FL.func))
++        {
++            import dmd.backend.arm.cod2 : cdrelconst;
++            cdrelconst(cgstate, cdb, e, outretregs);
++            return;
++        }
++
+         // See if we can use register that parameter was passed in
+         //printf("xyzzy1 %s %d %d\n", e.Vsym.Sident.ptr, cast(int)cgstate.regcon.params, regParamInPreg(e.Vsym));
+         if (cgstate.regcon.params &&
+diff -ruN dmd-2.113.1/compiler/src/dmd/backend/arm/cod2.d dmd-2.113.1/compiler/src/dmd/backend/arm/cod2.d
+--- dmd-2.113.1/compiler/src/dmd/backend/arm/cod2.d	2026-10-31 15:30:53.000000000 +0100
++++ dmd-2.113.1/compiler/src/dmd/backend/arm/cod2.d	2026-11-02 06:44:41.298621546 +0100
+@@ -163,7 +163,8 @@
+                 default:
+                     assert(0);
+             }
+-            callclib(cdb,e,clib,pretregs,0);
++            // Left in v0, right in v1. __subtf3/__divtf3 are not commutative.
++            callclib(cdb,e,clib,pretregs,0,Rn,Rm);
+         }
+         else
+         {
+@@ -211,6 +212,18 @@
+             uint opt = 0;
+             uint option = tyToExtend(ty);
+             uint imm3 = 0;
++            // addsub_ext extends Rm, not Rn. A pointer+TYint (the optimizer
++            // narrows offsets that fit in a signed 32) must SXTW that int.
++            // UXTX of the result type turns mov w,#-4 into ptr+0xfffffffc.
++            if (sz > tysize(ty2))
++                option = tyToExtend(ty2);
++            else if (e.Eoper == OPadd && sz > tysize(ty1))
++            {
++                reg_t tmp = Rn;
++                Rn = Rm;
++                Rm = tmp;
++                option = tyToExtend(ty1);
++            }
+             cdb.gen1(INSTR.addsub_ext(sf, op, S, opt, Rm, option, imm3, Rn, Rd));
+             PSW = 0;
+             pretregs &= ~mPSW;
+@@ -1179,7 +1192,10 @@
+         return;
+     }
+     const tym = tybasic(e.Ety);
+-    const sz = _tysize[tym];
++    int sz = _tysize[tym];
++    // TYstruct/TYarray stay -1 in _tysize. The real size is on e.ET.
++    if (sz < 0 && e.ET)
++        sz = cast(int)type_size(e.ET);
+     const uns  = tyuns(tym) != 0;
+ 
+     const tym1 = tybasic(e.E1.Ety);
+@@ -1191,6 +1207,20 @@
+     const Rn = findreg(retregs1);           // Rn is the pointer
+ 
+     bool isPair = isRegisterPair(true, tym, 0);
++    // isRegisterPair sees _tysize -1 for TYstruct and says "not a pair".
++    // A 16-byte integer struct is two GPRs. A 16-byte real is one Q register.
++    if (!tyfloating(tym) && sz > REGSIZE && sz <= 2 * REGSIZE)
++        isPair = true;
++
++    /* A struct bigger than a register pair is not a value in regs.
++     * fixresult() treats TYstruct as the address of the object, which is
++     * what evaluating E1 just produced.
++     */
++    if (tym == TYstruct && (sz < 0 || sz > 2 * REGSIZE))
++    {
++        fixresult(cdb, e, retregs1, pretregs);
++        return;
++    }
+ 
+     if (tyfloating(tym))
+     {
+@@ -1300,7 +1330,6 @@
+         case decode(8, 8, 0):
+         case decode(8, 8, 1): size = 3; opc = 1; break; // ldr 64
+         default:
+-            printf("%d %d %d\n", sz, sz1, uns);
+             assert(0);
+     }
+ 
+@@ -1812,10 +1841,12 @@
+         codelem(cgstate,cdb,e2,srcregs,false);
+     }
+ 
+-    // load pointer to lvalue (destination) in DI
+-    regm_t dstregs = cgstate.allregs & ~pretregs;
++    // Destination must not reuse the source pointer. A call result sits in
++    // x0 without being marked saved, and allocreg() will pick x0 again.
++    // That copies the destination onto itself (writeln's File blit).
++    regm_t dstregs = cgstate.allregs & ~pretregs & ~srcregs;
+     if (!dstregs)
+-        dstregs = cgstate.allregs;
++        dstregs = cgstate.allregs & ~srcregs;
+     if (e1.Eoper == OPind)               // if (*p = ..)
+     {
+         scodelem(cg,cdb,e1.E1,dstregs,srcregs,false);
+@@ -1861,7 +1892,7 @@
+             loadFromEA(csrc,Rv,4,4);
+             cdb.genc1(csrc.Iop,0,FL.offset,offset);
+             storeToEA(cdst,Rv,4);
+-            cdb.genc1(csrc.Iop,0,FL.offset,offset);
++            cdb.genc1(cdst.Iop,0,FL.offset,offset);
+             offset += 4;
+             numbytes -= 4;
+         }
+@@ -1871,7 +1902,7 @@
+             loadFromEA(csrc,Rv,4,2);
+             cdb.genc1(csrc.Iop,0,FL.offset,offset);
+             storeToEA(cdst,Rv,2);
+-            cdb.genc1(csrc.Iop,0,FL.offset,offset);
++            cdb.genc1(cdst.Iop,0,FL.offset,offset);
+             offset += 2;
+             numbytes -= 2;
+         }
+@@ -1881,7 +1912,7 @@
+             loadFromEA(csrc,Rv,4,1);
+             cdb.genc1(csrc.Iop,0,FL.offset,offset);
+             storeToEA(cdst,Rv,1);
+-            cdb.genc1(csrc.Iop,0,FL.offset,offset);
++            cdb.genc1(cdst.Iop,0,FL.offset,offset);
+         }
+     }
+     else
+@@ -2051,6 +2082,23 @@
+  * reg.
+  */
+ 
++/* Add a byte offset to an address already in reg.
++ * Used after a GOT or TLS sequence, whose relocations address the symbol itself.
++ */
++private void addRegOffset(ref CodeBuilder cdb, reg_t reg, targ_size_t off)
++{
++    if (!off)
++        return;
++    if (off < 0x1000)
++    {
++        cdb.gen1(INSTR.add_addsub_imm(1, 0, cast(uint)off, reg, reg));
++        return;
++    }
++    const reg_t tmp = reg == 17 ? 16 : 17;
++    movregconst(cdb, tmp, off, 64);
++    cdb.gen1(INSTR.addsub_shift(1, 0, 0, 0, cast(ubyte)tmp, 0, cast(ubyte)reg, cast(ubyte)reg));
++}
++
+ @trusted
+ void getoffset(ref CGstate cg, ref CodeBuilder cdb,elem* e,reg_t reg)
+ {
+@@ -2084,6 +2132,20 @@
+             if (config.exe & EX_posix)
+             {
+                 if (log) printf("posix threaded\n");
++                if (config.flags3 & CFG3pic)
++                {
++                    // Shared objects cannot use local-exec. Initial-exec matches
++                    // R_AARCH64_TLSIE_ADR_GOTTPREL_PAGE21 / LO12.
++                    regm_t scratch = INSTR.ALLREGS & ~mask(reg);
++                    reg_t r = allocreg(cdb, scratch, TYoffset);
++                    cdb.gen1(INSTR.systemmove(1, INSTR.tpidr_el0, r)); // MRS r,tpidr_el0
++                    cdb.gencs1(INSTR.adr(1, 0, reg), 0, fl, e.Vsym);    // ADRP reg,:gottprel:sym
++                    cdb.gencs1(INSTR.ldr_imm_gen(1, reg, reg, 0), 0, fl, e.Vsym);
++                    cdb.last.Iflags |= CFadd;                            // LDR reg,[reg,:gottprel_lo12:sym]
++                    cdb.gen1(INSTR.addsub_shift(1, 0, 0, 0, reg, 0, r, reg)); // ADD reg,reg,r
++                    addRegOffset(cdb, reg, e.Voffset);
++                    return;
++                }
+                 uint ins = INSTR.systemmove(1,INSTR.tpidr_el0,reg); // MRS reg,tpidr_el0
+                 cdb.gen1(ins);
+ 
+@@ -2093,6 +2155,7 @@
+                 ins = INSTR.addsub_imm(1,0,0,0,0,reg,reg);          // ADD reg,reg,#0
+                 cdb.gencs1(ins,0,fl,e.Vsym);
+                 cdb.last.Iflags |= CFadd;
++                addRegOffset(cdb, reg, e.Voffset);
+                 return;
+             }
+             assert(0);
+@@ -2228,7 +2291,9 @@
+             goto L4;
+ 
+         case FL.extern_:
+-            if (config.exe & EX_posix)
++            // Only thread-locals. A plain extern (memset, TypeInfo, ModuleInfo)
++            // is an ordinary address; treating it as TLS stores through TP+GOT.
++            if (config.exe & EX_posix && (e.Vsym.ty() & mTYthread))
+             {
+                 if (log) printf("posix extern threaded\n");
+                 regm_t scratch = INSTR.ALLREGS & ~mask(reg);
+@@ -2236,14 +2301,15 @@
+                 uint ins = INSTR.systemmove(1,INSTR.tpidr_el0,r);  // MRS r,tpidr_el0
+                 cdb.gen1(ins);
+ 
+-                ins = INSTR.adr(1,0,reg);                          // ADRP reg,0<foo>
++                ins = INSTR.adr(1,0,reg);                          // ADRP reg,:gottprel:sym
+                 cdb.gencs1(ins,0,fl,e.Vsym);
+ 
+-                ins = INSTR.ldr_imm_gen(1,reg,reg,0);              // LDR  reg,[reg]
++                ins = INSTR.ldr_imm_gen(1,reg,reg,0);              // LDR  reg,[reg,:gottprel_lo12:sym]
+                 cdb.gencs1(ins,0,fl,e.Vsym);
+                 cdb.last.Iflags |= CFadd;
+ 
+-                cdb.gen1(INSTR.addsub_shift(1,0,0,0,reg,0,r,reg)); // ADD reg,r,reg
++                cdb.gen1(INSTR.addsub_shift(1, 0, 0, 0, reg, 0, r, reg)); // ADD reg,reg,r
++                addRegOffset(cdb, reg, e.Voffset);
+                 return;
+             }
+ //            if (config.exe & EX_WIN64 && e.Vsym.ty() & mTYthread)
+@@ -2274,16 +2340,41 @@
+             }
+             else
+             {
+-                uint ins = INSTR.adr(1,0,reg);                // ADRP reg,0<foo>
+-                cdb.gencs1(ins,0,fl,e.Vsym);
+-
+-                cs.Iop = INSTR.addsub_imm(1,0,0,0,0,reg,reg); // ADD reg,reg,#0
+-                cs.Iflags |= CFadd;
+-                cs.IFL1 = fl;
+-                cdb.gen(&cs);
+-
+-                if (e.Voffset)
+-                    cdb.gen1(INSTR.addsub_imm(1,0,0,0,cast(uint)e.Voffset,reg,reg)); // ADD reg,reg,#Voffset
++                // ADRP+ADD of a default-visibility or external symbol is rejected
++                // in a shared object and in PIE (R_AARCH64_ADR_PREL_PG_HI21
++                // "may bind externally"). Local/static symbols are retargeted
++                // at a section symbol and can keep ADRP+ADD. TLS is not this path.
++                const bool picGot = (config.flags3 & CFG3pic) && e.Vsym &&
++                    e.Vsym.Sclass != SC.static_ && e.Vsym.Sclass != SC.locstat;
++                if (picGot)
++                {
++                    // GOT entry is the symbol address. A field offset is a
++                    // later ADD, not a reloc addend: the GOT slot is for S, not S+A.
++                    uint ins = INSTR.adr(1,0,reg);             // ADRP reg,:got:sym
++                    cdb.gencs1(ins,0,fl,e.Vsym);
++                    cdb.last.IEV1.Voffset = 0;
++                    cdb.last.Iflags |= CFgot;
++
++                    cs.Iop = INSTR.ldr_imm_gen(1,reg,reg,0);   // LDR reg,[reg,:got_lo12:sym]
++                    cs.Iflags |= CFgot | CFadd;
++                    cs.IFL1 = fl;
++                    cs.IEV1.Vsym = e.Vsym;
++                    cs.IEV1.Voffset = 0;
++                    cdb.gen(&cs);
++                    addRegOffset(cdb, reg, e.Voffset);
++                }
++                else
++                {
++                    uint ins = INSTR.adr(1,0,reg);                // ADRP reg,0<foo>
++                    cdb.gencs1(ins,0,fl,e.Vsym);
++                    // Both relocs carry the field offset so a page crossing stays correct.
++                    cdb.last.IEV1.Voffset = e.Voffset;
++
++                    cs.Iop = INSTR.addsub_imm(1,0,0,0,0,reg,reg); // ADD reg,reg,#0
++                    cs.Iflags |= CFadd;
++                    cs.IFL1 = fl;
++                    cdb.gen(&cs);
++                }
+             }
+             break;
+ 
+@@ -2595,8 +2686,9 @@
+     {
+         gentstreg(cdb,cs.reg,sz == 8);          // CMP cs.reg,#0
+ 
+-        // If lvalue is a register variable, we must mark it as modified
+-        getregs(cdb,cs.reg);
++        // If lvalue is a register variable, we must mark it as modified.
++        // cs.reg is a register number; getregs() takes a mask.
++        getregs(cdb, mask(cs.reg));
+ 
+         const n = e2.Vint;
+         uint opx = e.Eoper == OPpostinc ? 0 : 1;
+@@ -2624,8 +2716,12 @@
+             pretregs &= ~mPSW;
+         }
+ 
+-        /* If lvalue is a register variable, we must mark it as modified */
+-        getregs(cdb,reg);
++        /* If lvalue is a register variable, we must mark it as modified.
++         * allocreg() already called getregs() on the scratch. Passing the
++         * scratch's register number here clears unrelated parameter regs.
++         */
++        if (cs.reg != NOREG)
++            getregs(cdb, mask(cs.reg));
+ 
+         const n = e2.Vint;
+         uint opx = e.Eoper == OPpostinc ? 0 : 1;
+diff -ruN dmd-2.113.1/compiler/src/dmd/backend/arm/cod3.d dmd-2.113.1/compiler/src/dmd/backend/arm/cod3.d
+--- dmd-2.113.1/compiler/src/dmd/backend/arm/cod3.d	2026-10-31 15:30:53.000000000 +0100
++++ dmd-2.113.1/compiler/src/dmd/backend/arm/cod3.d	2026-11-02 06:44:41.298621546 +0100
+@@ -30,7 +30,10 @@
+ import dmd.backend.cdef;
+ import dmd.backend.cgcse;
+ import dmd.backend.code;
+-import dmd.backend.arm.cod1 : loadFromEA, storeToEA;
++// The AArch64 getlvalue. dmd.backend.code publicly imports the x86 one,
++// which stores a modrm byte in the same field as reg. Spill stores then
++// become MOV x6,reg instead of STR to the stack home (BPRM is 6).
++import dmd.backend.arm.cod1 : loadFromEA, storeToEA, getlvalue;
+ import dmd.backend.arm.disasmarm : encodeHFD;
+ import dmd.backend.x86.cgcod : disassemble;
+ import dmd.backend.x86.code_x86;
+@@ -1030,8 +1033,12 @@
+             else
+             {
+                 if (log) printf("epilog: mov sp,bp\n");
+-                if (16 + xlocalsize <= 512) // or localsize??
+-                    cdbx.gen1(INSTR.ldstpair_post(2, 0, 1, cast(uint)(16 + localsize) / 8, 30, 31, 29)); // LDP x29,x30,[sp],#16 + localsize
++                // LDP post-index imm7 is signed. 63*8 = 504 is the largest
++                // positive release; 512 encodes as -512 and grows the stack.
++                // Match the prologue, which allocates 16+xlocalsize (not localsize).
++                const uint release = cast(uint)(16 + xlocalsize);
++                if (release <= 504 && (release & 7) == 0)
++                    cdbx.gen1(INSTR.ldstpair_post(2, 0, 1, release / 8, 30, 31, 29)); // LDP x29,x30,[sp],#release
+                 else
+                 {
+                     /* LDP x29,x30,[sp] https://www.scs.stanford.edu/~zyedidia/arm64/ldp_gen.html
+@@ -1224,8 +1231,12 @@
+             cdb.append(c1);
+         }
+     }
+-    cdb.gencs1(INSTR.bl(0),0,FL.func,sfunc); // BL sfunc // http://www.scs.stanford.edu/~zyedidia/arm64/bl.html
+-    cdb.last().Iflags |= (CFselfrel | CFoff);
++    // Tail branch. Thunks are laid out back-to-back, so a BL would
++    // return into the next thunk (the last one falls into whatever
++    // function follows). x30 stays the original caller's return address.
++    // https://www.scs.stanford.edu/~zyedidia/arm64/b_uncond.html
++    cdb.gencs1(INSTR.b_uncond(0),0,FL.func,sfunc);
++    cdb.last().Iflags |= (CFselfrel | CFoff | CFjump);
+ 
+     thunkoffset = Offset(seg);
+     code* c = cdb.finish();
+@@ -1449,22 +1460,32 @@
+         }
+         else // one or both are floating point registers
+         {
+-            const uint ftype = INSTR.szToFtype(ty == TYMAX ? 8 : _tysize[ty]);
+-            if (to & from & 32) // both are fp registers
++            const uint sz = ty == TYMAX ? 8 : _tysize[ty];
++            if ((to & 32) && (from & 32) && sz == 16)
+             {
+-                // floating point
+-                cdb.gen1(INSTR.fmov(ftype, from, to));               // FMOV fp,fp https://www.scs.stanford.edu/~zyedidia/arm64/fmov_float.html
++                // 128-bit real. Scalar FMOV Hd,Hn would keep only the low 16 bits.
++                cdb.gen1(INSTR.mov_orr_advsimd_reg(1, from, to)); // MOV Vd.16b,Vn.16b
+             }
+-            else if ((to & 32) && !(from & 32))
+-            {
+-                cdb.gen1(INSTR.fmov_float_gen(1,ftype,0,7,from,to)); // FMOV fp,gp https://www.scs.stanford.edu/~zyedidia/arm64/fmov_float_gen.html
+-            }
+-            else if (!(to & 32) && (from & 32))
++            else
+             {
+-                cdb.gen1(INSTR.fmov_float_gen(1,ftype,0,6,from,to)); // FMOV gp,fp https://www.scs.stanford.edu/~zyedidia/arm64/fmov_float_gen.html
++                assert(sz != 16); // a quad does not fit through scalar FMOV
++                const uint ftype = INSTR.szToFtype(sz);
++                if (to & from & 32) // both are fp registers
++                {
++                    // floating point
++                    cdb.gen1(INSTR.fmov(ftype, from, to));               // FMOV fp,fp https://www.scs.stanford.edu/~zyedidia/arm64/fmov_float.html
++                }
++                else if ((to & 32) && !(from & 32))
++                {
++                    cdb.gen1(INSTR.fmov_float_gen(1,ftype,0,7,from,to)); // FMOV fp,gp https://www.scs.stanford.edu/~zyedidia/arm64/fmov_float_gen.html
++                }
++                else if (!(to & 32) && (from & 32))
++                {
++                    cdb.gen1(INSTR.fmov_float_gen(1,ftype,0,6,from,to)); // FMOV gp,fp https://www.scs.stanford.edu/~zyedidia/arm64/fmov_float_gen.html
++                }
++                else
++                    assert(0);
+             }
+-            else
+-                assert(0);
+         }
+     }
+ }
+@@ -1747,17 +1768,34 @@
+                     //printf("fix ESP\n");
+                     if (cgstate.hasframe)
+                     {
+-                        c.Iop = INSTR.sub_addsub_imm(1,0,cgstate.EBPtoESP,INSTR.SP,BP); // SUB SP,BP,#EBPtoESP
++                        // x86 is LEA ESP,-EBPtoESP[EBP]. SP = X29 - delta.
++                        // addsub_imm's imm12 is only 12 bits; a larger frame
++                        // (or a catch block in one) needs the lsl#12 form too.
++                        // INSTR.BP is X29. Bare BP is the x86 register number.
++                        const uint delta = cast(uint)cgstate.EBPtoESP;
++                        const uint lo = delta & 0xFFF;
++                        const uint hi = delta >> 12;
++                        assert(hi < 0x1000);
++                        c.Iop = INSTR.sub_addsub_imm(1, 0, lo, INSTR.BP, INSTR.SP);
++                        code* tail = c;
++                        if (hi)
++                        {
++                            code* cn = code_calloc();
++                            cn.Iop = INSTR.sub_addsub_imm(1, 1, hi, INSTR.SP, INSTR.SP);
++                            cn.next = c.next;
++                            c.next = cn;
++                            tail = cn;
++                        }
+                         if (cgstate.enforcealign)
+                         {
+                             code* cn = code_calloc();
+ 
+                             uint N,immr,imms;
+                             assert(encodeNImmrImms(-cast(long)STACKALIGN,N,immr,imms));
+-                            cn.Iop = INSTR.log_imm(1,0,N,immr,imms,SP,SP);      // AND SP,SP,#-STACKALIGN
++                            cn.Iop = INSTR.log_imm(1,0,N,immr,imms,INSTR.SP,INSTR.SP); // AND SP,SP,#-STACKALIGN
+ 
+-                            cn.next = c.next;
+-                            c.next = cn;
++                            cn.next = tail.next;
++                            tail.next = cn;
+                         }
+                     }
+                     continue;
+@@ -1907,7 +1945,7 @@
+ 
+             case FL.allocatmp:
+                 offset = c.IEV1.Vpointer + cgstate.Alloca.offset + cgstate.BPoff;
+-                assert(0); //goto L2;
++                goto L2;
+ 
+             case FL.funcarg:
+                 offset = c.IEV1.Vpointer + cgstate.funcarg.offset + cgstate.BPoff;
+@@ -2313,7 +2351,9 @@
+                 case SC.inline:
+                     ggen.flush();
+                     ggen.gen32(op);
+-                    objmod.reftoident(ggen.seg,ggen.offset,s,op,flags);
++                    // The instruction is already in the section. RELA addend is
++                    // the symbol displacement, not the opcode.
++                    objmod.reftoident(ggen.seg,ggen.offset,s,c.IEV1.Voffset,flags);
+                     break;
+ 
+                 default:
+diff -ruN dmd-2.113.1/compiler/src/dmd/backend/arm/cod4.d dmd-2.113.1/compiler/src/dmd/backend/arm/cod4.d
+--- dmd-2.113.1/compiler/src/dmd/backend/arm/cod4.d	2026-10-31 15:30:53.000000000 +0100
++++ dmd-2.113.1/compiler/src/dmd/backend/arm/cod4.d	2026-11-02 07:09:17.201736436 +0100
+@@ -134,7 +134,9 @@
+             // If loading result into a register
+             if (cs.reg != NOREG)
+             {
+-                getregs(cdb, cs.reg);
++                // cs.reg is a register number. getregs() takes a mask;
++                // passing the number leaves the parameter register live.
++                getregs(cdb, mask(cs.reg));
+                 const p = cast(targ_size_t*) &(e2.EV);
+                 movregconst(cdb,cs.reg,*p,sz == 8);
+             }
+@@ -240,8 +242,11 @@
+         storeToEA(cs, mswreg, sz / 2);
+         cdb.gen(&cs);
+     }
+-    else
+-        assert(sz <= REGSIZE);
++    else if (sz > REGSIZE)
++    {
++        // 16-byte real is one SIMD Q register. storeToEA already wrote it.
++        assert(sz == 16 && tyfloating(tyml));
++    }
+ 
+     if (e1.Ecount ||                    // if lvalue is a CSE or
+         regvar)                         // rvalue can't be a CSE
+@@ -424,7 +429,11 @@
+         uint imm3 = 0;                // shift amount
+         uint S = forccs != 0;
+         uint opt = 0;
++        // Extend the rvalue when it is narrower than the lvalue. Same
++        // signed-offset bug as cdorth: longvar += -4 is a TYint addend.
+         uint option = cast(ubyte)tyToExtend(tyml);
++        if ((op == OPaddass || op == OPminass) && sz > tysize(e.E2.Ety))
++            option = cast(ubyte)tyToExtend(e.E2.Ety);
+         reg_t Rm = reg2;
+         reg_t Rn = reg1;
+         reg_t Rd = reg1;
+@@ -710,7 +719,11 @@
+         }
+         regm_t idxregs = idxregm(cs);  // save index registers so we can do the storeToEA() later
+         regm_t dummy;
+-        callclib(cdb,null,clib,dummy,idxregs);
++        // reg is the left operand, rreg the right. The product comes back in
++        // v0; reg still names the pre-call left value, which must not be stored.
++        callclib(cdb,null,clib,dummy,idxregs,reg,rreg);
++        reg = 32;
++        retregs = mask(32);
+     }
+     else
+     {
+@@ -1565,10 +1578,10 @@
+     {
+         case OPd_s16:                               // fcvtzs w0,d31  // sxth w0,w0
+         case OPd_s32: ftype = 1; sf = 0; goto L2;   // fcvtzs w0,d31
+-        case OPd_s64: ftype = 1; sf = 1; goto L2;   // fcvtzs d31,d31 // fmov x0,d31
++        case OPd_s64: ftype = 1; sf = 1; goto L2;   // fcvtzs x0,d31
+         case OPd_u16:                               // fcvtzu w0,d31  // and w0,w0,#0xFFFF
+         case OPd_u32:                               // fcvtzu w0,d31
+-        case OPd_u64:                               // fcvtzu d31,d31 // fmov x0,d31
++        case OPd_u64:                               // fcvtzu x0,d31
+         L2:
+             regm_t retregs1 = INSTR.FLOATREGS;
+             codelem(cgstate,cdb,e.E1,retregs1,false);
+@@ -1590,8 +1603,9 @@
+                     cdb.gen1(INSTR.fcvtzs(0,1,V1,Rd));                  // fcvtzs Rd,V1
+                     break;
+                 case OPd_s64:
+-                    cdb.gen1(INSTR.fcvtzs_asisdmisc(1,V1,V1));          // fcvtzs V1,V1
+-                    cdb.gen1(INSTR.fmov_float_gen(1,1,0,6,V1,Rd));      // fmov Rd,V1
++                    // Scalar FCVTZS Xd,Dn. The vector form writes the
++                    // integer into Dn and destroys a still-live double.
++                    cdb.gen1(INSTR.fcvtzs(1, 1, V1, Rd));               // fcvtzs Rd,V1
+                     break;
+                 case OPd_u16:
+                     cdb.gen1(INSTR.fcvtzu(0,ftype,V1,Rd));              // fcvtzu Rd,V1
+@@ -1603,8 +1617,7 @@
+                     cdb.gen1(INSTR.fcvtzu(0,1,V1,Rd));                  // fcvtzu Rd,V1
+                     break;
+                 case OPd_u64:
+-                    cdb.gen1(INSTR.fcvtzu_asisdmisc(1,V1,V1));          // fcvtzu V1,V1
+-                    cdb.gen1(INSTR.fmov_float_gen(1,1,0,6,V1,Rd));      // fmov Rd,V1
++                    cdb.gen1(INSTR.fcvtzu(1, 1, V1, Rd));               // fcvtzu Rd,V1
+                     break;
+                 default:
+                     assert(0);
+@@ -1696,6 +1709,12 @@
+             callclib(cdb,e,clib,pretregs,0);
+             break;
+ 
++        case OPld_u64:  // call __fixunstfdi
++            regm_t uregs = mask(32);
++            codelem(cgstate,cdb,e.E1,uregs,false);
++            callclib(cdb,e,CLIB_A.realToU64,pretregs,0);
++            break;
++
+         default:
+             assert(0);
+     }
+@@ -1748,7 +1767,10 @@
+             Extend extend = e1.Eoper == OPu8_16 ? Extend.UXTB : Extend.UXTH;
+             cs.Sextend = cast(ubyte)((cs.Sextend & 8) | extend);  // preserve S bit
+             reg_t reg = allocreg(cdb,retregs,TYint);
+-            loadFromEA(cs,reg,8,tysize(e1.Ety));
++            // e1.Ety is the widened result (int). The memory operand is
++            // e1.E1, a byte or a short. Loading the widened size reads
++            // the next element (binsize[n] became 0x00600040).
++            loadFromEA(cs,reg,8,tysize(e1.E1.Ety));
+             cdb.gen(&cs);
+             freenode(e1.E1);
+             freenode(e1);
+@@ -1784,7 +1806,8 @@
+         Extend extend = e1.Eoper == OPs8_16 ? Extend.SXTB : Extend.SXTH;
+         cs.Sextend = cast(ubyte)((cs.Sextend & 8) | extend);  // preserve S bit
+         reg_t reg = allocreg(cdb,retregs,TYint);
+-        loadFromEA(cs,reg,8,tysize(e1.Ety));
++        // Same as the unsigned path: load the narrow memory operand.
++        loadFromEA(cs,reg,8,tysize(e1.E1.Ety));
+         cdb.gen(&cs);
+         freenode(e1.E1);
+         freenode(e1);
+@@ -1822,7 +1845,9 @@
+                 //    INSTR.log_imm(sf,opc,N,immr,imms,Rn,Rd)
+                 uint N,immr,imms;
+                 assert(encodeNImmrImms(0xFF,N,immr,imms));
+-                uint ins = INSTR.log_imm(0,0,N,immr,imms,cs.reg,reg); // AND reg,cs.reg,#0xFF
++                // 0xFF encodes as a 64-bit mask (N=1). AND Wd,Wn,#0xFF is
++                // the same immr/imms with N=0; N=1 is an undefined 32-bit op.
++                uint ins = INSTR.log_imm(0,0,0,immr,imms,cs.reg,reg);
+                 cdb.gen1(ins);
+             }
+             else
+diff -ruN dmd-2.113.1/compiler/src/dmd/backend/arm/instr.d dmd-2.113.1/compiler/src/dmd/backend/arm/instr.d
+--- dmd-2.113.1/compiler/src/dmd/backend/arm/instr.d	2026-10-31 15:30:53.000000000 +0100
++++ dmd-2.113.1/compiler/src/dmd/backend/arm/instr.d	2026-11-02 07:11:32.658718424 +0100
+@@ -1465,7 +1465,8 @@
+         // ldrsb Rt,[Xn,#offset]
+         uint size = 0;
+         uint imm12 = cast(uint)offset & 0xFFF;
+-        return ldst_pos(size, 0, 2 + is64, imm12, Rn, Rt);
++        // opc 2 is the 64-bit form, opc 3 is the 32-bit form.
++        return ldst_pos(size, 0, is64 ? 2 : 3, imm12, Rn, Rt);
+     }
+ 
+     /* LDRH(immediate) Unsigned offset
+@@ -1487,7 +1488,8 @@
+         // ldrsh Rt,[Xn,#offset]
+         uint size = 1;
+         uint imm12 = cast(uint)offset & 0xFFF;
+-        return ldst_pos(size, 0, 2 + is64, imm12, Rn, Rt);
++        // opc 2 is the 64-bit form, opc 3 is the 32-bit form.
++        return ldst_pos(size, 0, is64 ? 2 : 3, imm12, Rn, Rt);
+     }
+ 
+     /* LDR (immediate) Unsigned offset
+@@ -1548,7 +1550,7 @@
+     static uint ldrsb_reg(uint sz,reg_t Rindex,uint extend,uint S,reg_t Rbase,reg_t Rt)
+     {
+         // LDRB Rt,Rbase,Rindex,extend S
+-        return ldst_regoff(0, 0, 2 + (sz == 8), Rindex, extend, S, Rbase, Rt);
++        return ldst_regoff(0, 0, (sz == 8) ? 2 : 3, Rindex, extend, S, Rbase, Rt);
+     }
+ 
+     /* LDRH (register) Extended register
+@@ -1568,7 +1570,7 @@
+     static uint ldrsh_reg(uint sz,reg_t Rindex,uint extend,uint S,reg_t Rbase,reg_t Rt)
+     {
+         // LDRSH Rt,Rbase,Rindex,extend S
+-        return ldst_regoff(1, 0, 2 + (sz == 8), Rindex, extend, S, Rbase, Rt);
++        return ldst_regoff(1, 0, (sz == 8) ? 2 : 3, Rindex, extend, S, Rbase, Rt);
+     }
+ 
+     /* LDR (register)
+diff -ruN dmd-2.113.1/compiler/src/dmd/backend/dwarfdbginf.d dmd-2.113.1/compiler/src/dmd/backend/dwarfdbginf.d
+--- dmd-2.113.1/compiler/src/dmd/backend/dwarfdbginf.d	2026-10-31 15:30:53.000000000 +0100
++++ dmd-2.113.1/compiler/src/dmd/backend/dwarfdbginf.d	2026-11-02 02:49:40.116243374 +0100
+@@ -201,7 +201,12 @@
+     void dwarf_addrel(int seg, targ_size_t offset, int targseg, targ_size_t val = 0)
+     {
+         if (config.objfmt == OBJ_ELF)
+-            Obj.addrel(seg, offset, I64 ? R_X86_64_32 : R_386_32, cast(int)MAP_SEG2SYMIDX(targseg), val);
++        {
++            auto rel = I64 ? R_X86_64_32 : R_386_32;
++            if (config.target_cpu == TARGET_AArch64)
++                rel = R_AARCH64_ABS32;     // udata4 absolute, not an x86 reloc
++            Obj.addrel(seg, offset, rel, cast(int)MAP_SEG2SYMIDX(targseg), val);
++        }
+         else if (config.objfmt == OBJ_MACH)
+             Obj.addrel(seg, offset, cast(Symbol*) null, targseg, RELaddr, cast(int)val);
+         else
+@@ -211,7 +216,10 @@
+     void dwarf_addrel64(int seg, targ_size_t offset, int targseg, targ_size_t val)
+     {
+         if (config.objfmt == OBJ_ELF)
+-            Obj.addrel(seg, offset, R_X86_64_64, cast(int)MAP_SEG2SYMIDX(targseg), val);
++        {
++            auto rel = config.target_cpu == TARGET_AArch64 ? R_AARCH64_ABS64 : R_X86_64_64;
++            Obj.addrel(seg, offset, rel, cast(int)MAP_SEG2SYMIDX(targseg), val);
++        }
+         else if (config.objfmt == OBJ_MACH)
+             Obj.addrel(seg, offset, null, targseg, RELaddr, cast(uint)val);
+         else
+diff -ruN dmd-2.113.1/compiler/src/dmd/backend/elem.d dmd-2.113.1/compiler/src/dmd/backend/elem.d
+--- dmd-2.113.1/compiler/src/dmd/backend/elem.d	2026-10-31 15:30:53.000000000 +0100
++++ dmd-2.113.1/compiler/src/dmd/backend/elem.d	2026-11-02 06:52:57.889851124 +0100
+@@ -1254,20 +1254,32 @@
+     {
+         case TYreal:
+         case TYireal:
+-            /* The size, alignment, and padding of long doubles may be different
+-             * from host to target
++            /* Host real is x87 when dmd itself was built on x86. The target
++             * constant must be IEEE binary128 or __multf3 returns 0.
+              */
+             p = buffer.ptr;
+-            // TODO AArch64 these are supposed to be 128 bit floats, not 80 bit
+-            memset(buffer.ptr, 0, sz);                      // ensure padding is 0
+-            memcpy(buffer.ptr, &e.Vreal, 10);
++            memset(buffer.ptr, 0, sz);
++            assert(sz == 16);
++            {
++                import dmd.root.longdouble : hostRealToIEEE128;
++                ubyte[16] q = void;
++                hostRealToIEEE128(e.Vreal, q);
++                memcpy(buffer.ptr, q.ptr, 16);
++            }
+             break;
+ 
+         case TYcreal:
+             p = buffer.ptr;
+             memset(buffer.ptr, 0, sz);
+-            memcpy(buffer.ptr, &e.Vcreal.re, 10);
+-            memcpy(buffer.ptr + tysize(TYreal), &e.Vcreal.im, 10);
++            assert(sz == 32);
++            {
++                import dmd.root.longdouble : hostRealToIEEE128;
++                ubyte[16] q = void;
++                hostRealToIEEE128(e.Vcreal.re, q);
++                memcpy(buffer.ptr, q.ptr, 16);
++                hostRealToIEEE128(e.Vcreal.im, q);
++                memcpy(buffer.ptr + 16, q.ptr, 16);
++            }
+             break;
+ 
+         default:
+diff -ruN dmd-2.113.1/compiler/src/dmd/backend/elfobj.d dmd-2.113.1/compiler/src/dmd/backend/elfobj.d
+--- dmd-2.113.1/compiler/src/dmd/backend/elfobj.d	2026-10-31 15:30:53.000000000 +0100
++++ dmd-2.113.1/compiler/src/dmd/backend/elfobj.d	2026-11-02 05:47:04.395456856 +0100
+@@ -1504,7 +1504,8 @@
+                      : ElfObj_getsegment(".fini_array", null, SHT_FINI_ARRAY, SHF_ALLOC|SHF_WRITE, _tysize[TYnptr]);
+     else
+         seg = ElfObj_getsegment(isCtor ? ".ctors" : ".dtors", null, SHT_PROGBITS, SHF_ALLOC|SHF_WRITE, _tysize[TYnptr]);
+-    const reltype_t reltype = I64 ? R_X86_64_64 : R_386_32;
++    const reltype_t reltype = config.target_cpu == TARGET_AArch64 ? R_AARCH64_ABS64 :
++                              I64 ? R_X86_64_64 : R_386_32;
+     const size_t sz = ElfObj_writerel(seg, cast(uint)SegData[seg].SDoffset, reltype, sfunc.Sxtrnnum, 0);
+     SegData[seg].SDoffset += sz;
+ }
+@@ -2761,7 +2762,12 @@
+     {
+         // Elf64_Rela stores addend in Rela.r_addend field
+         sz = relsize64(reltype);
+-        if (!elfobj.AArch64 || reltype == R_AARCH64_ABS64) // TODO AArch64: extend to all fixups?
++        // Instruction relocs patch a field the code generator already
++        // encoded. Data relocs have no instruction, so the slot must exist.
++        if (!elfobj.AArch64 ||
++            reltype == R_AARCH64_ABS64 ||
++            reltype == R_AARCH64_ABS32 ||
++            reltype == R_AARCH64_PREL32)
+         {
+             //printf("writeaddrval() targseg: %d offset: %lld sz: %lld\n", targseg, offset, sz);
+             writeaddrval(targseg, offset, 0, sz);
+@@ -2812,7 +2818,9 @@
+ 
+         if (flags & CFoffset64)
+         {
+-            relinfo = R_X86_64_64;
++            // R_X86_64_64 is numeric type 1, which AArch64 calls P32_ABS32.
++            // A pointer in .data (a slice's .ptr, a static address) is ABS64.
++            relinfo = elfobj.AArch64 ? R_AARCH64_ABS64 : R_X86_64_64;
+             if (flags & CFswitch) targetsymidx = targetdatum;
+         }
+         else if (flags & CFswitch)
+@@ -3210,10 +3218,16 @@
+         case SC.locstat:
+             if (s.Sfl == FL.tlsdata)
+             {
+-                if (config.flags3 & CFG3pie)
+-                    relinfo = R_X86_64_TPOFF32;
++                if (config.flags3 & CFG3pic)
++                    relinfo = flags & CFadd ? R_AARCH64_TLSIE_LD64_GOTTPREL_LO12_NC : R_AARCH64_TLSIE_ADR_GOTTPREL_PAGE21;
+                 else
+-                    relinfo = config.flags3 & CFG3pic ? R_X86_64_TLSGD : R_X86_64_TPOFF32;
++                    relinfo = flags & CFadd ? R_AARCH64_TLSLE_ADD_TPREL_LO12_NC : R_AARCH64_TLSLE_ADD_TPREL_HI12;
++            }
++            else if (segtyp != CODE && !(flags & CFadd))
++            {
++                // A 4- or 8-byte pointer in a data section, not an ADRP.
++                relinfo = (flags & CFoffset64) ? R_AARCH64_ABS64 : R_AARCH64_ABS32;
++                refSize = (flags & CFoffset64) ? 8 : 4;
+             }
+             else
+             {
+@@ -3276,6 +3290,8 @@
+                         //printf("\tadding relocation\n");
+                         if (s.Sclass == SC.global && config.flags3 & CFG3pie && tyfunc(s.ty()))
+                             relinfo = R_X86_64_PC32;
++                        else if (flags & CFjump)
++                            relinfo = R_AARCH64_JUMP26;
+                         else
+                             relinfo = R_AARCH64_CALL26;
+                             //relinfo = config.flags3 & CFG3pic ?  R_X86_64_PLT32 : R_X86_64_PC32;
+@@ -3287,12 +3303,17 @@
+                     if (s.Sclass == SC.static_)
+                     {                           // offset into .data or .bss seg
+                         if (!isTLS)
++                        {
+                             refseg = MAP_SEG2SYMIDX(s.Sseg);    // use segment symbol table entry
+-                        //val += s.Soffset;
++                            val += s.Soffset;
++                        }
+ 
+-                        relinfo = flags & CFadd ? R_AARCH64_ADD_ABS_LO12_NC : R_AARCH64_ADR_PREL_PG_HI21;
+                         if (refSize == 8)
+                             relinfo = R_AARCH64_ABS64;
++                        else if (segtyp != CODE && !(flags & CFadd))
++                            relinfo = R_AARCH64_ABS32;
++                        else
++                            relinfo = flags & CFadd ? R_AARCH64_ADD_ABS_LO12_NC : R_AARCH64_ADR_PREL_PG_HI21;
+                         static if (0)
+                         {
+                             if (!(config.flags3 & CFG3pic) ||       // all static refs from normal code
+@@ -3308,14 +3329,20 @@
+                     }
+                     else if (segtyp == DATA)
+                     {                   // relocation from within DATA seg
+-                        relinfo = flags & CFadd ? R_AARCH64_ADD_ABS_LO12_NC : R_AARCH64_ADR_PREL_PG_HI21;
+                         if (refSize == 8)
+                             relinfo = R_AARCH64_ABS64;
++                        else if (flags & CFadd)
++                            relinfo = R_AARCH64_ADD_ABS_LO12_NC;
++                        else
++                            relinfo = R_AARCH64_ABS32;
+                     }
+                     else
+                     {                   // relocation from within CODE seg
+-                        relinfo = flags & CFadd ? R_AARCH64_ADD_ABS_LO12_NC : R_AARCH64_ADR_PREL_PG_HI21;
+-                        if (refSize == 8)
++                        if (flags & CFgot)
++                            relinfo = flags & CFadd ? R_AARCH64_LD64_GOT_LO12_NC : R_AARCH64_ADR_GOT_PAGE;
++                        else
++                            relinfo = flags & CFadd ? R_AARCH64_ADD_ABS_LO12_NC : R_AARCH64_ADR_PREL_PG_HI21;
++                        if (refSize == 8 && !(flags & CFgot))
+                             relinfo = R_AARCH64_ABS64;
+                         static if (0)
+                         {
+@@ -3330,7 +3357,9 @@
+ 
+                     if (isTLS)
+                     {
+-                        if (s.Sclass == SC.extern_)
++                        // PIC code uses initial-exec (ADRP/LDR). Local-exec ADD
++                        // relocations are rejected in a shared object.
++                        if (config.flags3 & CFG3pic || s.Sclass == SC.extern_)
+                             relinfo = flags & CFadd ? R_AARCH64_TLSIE_LD64_GOTTPREL_LO12_NC : R_AARCH64_TLSIE_ADR_GOTTPREL_PAGE21;
+                         else
+                             relinfo = flags & CFadd ? R_AARCH64_TLSLE_ADD_TPREL_LO12_NC : R_AARCH64_TLSLE_ADD_TPREL_HI12;
+@@ -3969,7 +3998,15 @@
+         ElfObj_writerel(codseg, off+ 6*4, R_AARCH64_ADD_ABS_LO12_NC,  minfo_beg, 0);
+         ElfObj_writerel(codseg, off+ 8*4, R_AARCH64_ADR_PREL_PG_HI21, dso_rec,   0);
+         ElfObj_writerel(codseg, off+ 9*4, R_AARCH64_ADD_ABS_LO12_NC,  dso_rec,   0);
+-        ElfObj_writerel(codseg, off+14*4, R_AARCH64_CALL26,           dso_rec,   0);
++        IDXSYM regsym;
++        if (REQUIRE_DSO_REGISTRY())
++            regsym = ElfObj_external_def("_d_dso_registry");
++        else
++        {
++            const namidx2 = ElfObj_addstr(&elfobj.symtab_strings, "_d_dso_registry");
++            regsym = elf_addsym(namidx2, 0, 0, STT_NOTYPE, STB_WEAK, SHN_UNDEF);
++        }
++        ElfObj_writerel(codseg, off+14*4, R_AARCH64_CALL26,           regsym,    0);
+         off = buf.length();
+ 
+         Offset(codseg) = off;
+@@ -3985,8 +4022,7 @@
+             // add to section group
+             SegData[groupseg].SDbuf.write32(MAP_SEG2SECIDX(cdseg));
+             // relocation
+-            const reltype2 = I64 ? R_X86_64_64 : R_386_32;
+-            SegData[cdseg].SDoffset += ElfObj_writerel(cdseg, 0, reltype2, MAP_SEG2SYMIDX(codseg), 0);
++            SegData[cdseg].SDoffset += ElfObj_writerel(cdseg, 0, R_AARCH64_ABS64, MAP_SEG2SYMIDX(codseg), 0);
+         }
+         {
+             const init_name = USE_INIT_ARRAY() ? ".init_array.d_dso_ctor" : ".ctors.d_dso_ctor";
+@@ -3996,8 +4032,7 @@
+             // add to section group
+             SegData[groupseg].SDbuf.write32(MAP_SEG2SECIDX(cdseg));
+             // relocation
+-            const reltype2 = I64 ? R_X86_64_64 : R_386_32;
+-            SegData[cdseg].SDoffset += ElfObj_writerel(cdseg, 0, reltype2, MAP_SEG2SYMIDX(codseg), 0);
++            SegData[cdseg].SDoffset += ElfObj_writerel(cdseg, 0, R_AARCH64_ABS64, MAP_SEG2SYMIDX(codseg), 0);
+         }
+     }
+     // set group section infos
+@@ -4081,7 +4116,12 @@
+ 
+             s.Sdw_ref_idx = elf_addsym(namidx, val, 8, STT_OBJECT, STB_WEAK, MAP_SEG2SECIDX(dataDWref_seg), STV_HIDDEN);
+         }
+-        ElfObj_writerel(seg, cast(uint)offset, I64 ? R_X86_64_PC32 : R_386_PC32, s.Sdw_ref_idx, 0);
++        // DW_EH_PE_indirect|pcrel|sdata4. On AArch64 that is a 4-byte
++        // PC-relative offset to the DW.ref slot, not an x86 PC32 reloc.
++        // writerel reserves the data bytes for R_AARCH64_PREL32.
++        const reltype_t relinfo = config.target_cpu == TARGET_AArch64 ? R_AARCH64_PREL32 :
++                                  I64 ? R_X86_64_PC32 : R_386_PC32;
++        ElfObj_writerel(seg, cast(uint)offset, relinfo, s.Sdw_ref_idx, 0);
+     }
+     else
+     {
+diff -ruN dmd-2.113.1/compiler/src/dmd/backend/elpicpie.d dmd-2.113.1/compiler/src/dmd/backend/elpicpie.d
+--- dmd-2.113.1/compiler/src/dmd/backend/elpicpie.d	2026-10-31 15:30:53.000000000 +0100
++++ dmd-2.113.1/compiler/src/dmd/backend/elpicpie.d	2026-11-02 03:55:12.470981932 +0100
+@@ -63,9 +63,12 @@
+             }
+ 
+             if (config.flags3 & CFG3pic &&
+-                !tyfunc(s.ty()))
++                !tyfunc(s.ty()) &&
++                config.target_cpu != TARGET_AArch64)
+             {
+-                return el_picvar(s);            // Position Independent Code
++                // x86 PIC rewrites the tree into GOT loads. AArch64 does that
++                // in getoffset(), and an extra OPind here would load twice.
++                return el_picvar(s);
+             }
+         }
+     }
+@@ -75,8 +78,11 @@
+     }
+     else if (config.exe & EX_posix)
+     {
+-        if (config.flags3 & CFG3pic && tyfunc(s.ty()))
++        if (config.flags3 & CFG3pic && tyfunc(s.ty()) &&
++            config.target_cpu != TARGET_AArch64)
+         {
++            // AArch64 calls are BL; the address of a function is a GOT load
++            // in getoffset(). The x86 EBX localgot is not a base register there.
+             switch (s.Sclass)
+             {
+                 case SC.comdat:
+@@ -603,7 +609,7 @@
+             case SC.locstat:
+                 if (config.flags3 & CFG3pie)
+                     x = 0;
+-                else if (s.Stype.Tty & mTYthread)
++                else if (s.Stype.Tty & mTYthread && config.target_cpu != TARGET_AArch64)
+                     x = 1;
+                 else
+                     x = 0;
+@@ -612,6 +618,8 @@
+             case SC.global:
+                 if (config.flags3 & CFG3pie)
+                     x = 0;
++                else if (s.Stype.Tty & mTYthread && config.target_cpu == TARGET_AArch64)
++                    x = 0;
+                 else
+                     x = 1;
+                 goto case_got64;
+@@ -619,7 +627,10 @@
+             case SC.comdat:
+             case SC.comdef:
+             case SC.extern_:
+-                x = 1;
++                if (s.Stype.Tty & mTYthread && config.target_cpu == TARGET_AArch64)
++                    x = 0;
++                else
++                    x = 1;
+                 goto case_got64;
+ 
+             case_got64:
+@@ -629,7 +640,9 @@
+                 tym_t tym = e.Ety;
+                 e.Ety = TYnptr;
+ 
+-                if (s.Stype.Tty & mTYthread)
++                // AArch64 PIC uses initial-exec in the backend. The x86
++                // __tls_get_addr sequence is not implemented there.
++                if (s.Stype.Tty & mTYthread && config.target_cpu != TARGET_AArch64)
+                 {
+                     /* Add "volatile" to prevent e from being common subexpressioned.
+                      * This is so we can preserve the magic sequence of instructions
+diff -ruN dmd-2.113.1/compiler/src/dmd/backend/x86/cgcod.d dmd-2.113.1/compiler/src/dmd/backend/x86/cgcod.d
+--- dmd-2.113.1/compiler/src/dmd/backend/x86/cgcod.d	2026-10-31 15:30:53.000000000 +0100
++++ dmd-2.113.1/compiler/src/dmd/backend/x86/cgcod.d	2026-11-02 06:25:54.678551350 +0100
+@@ -2833,10 +2833,12 @@
+                 /* if no return value       */
+                 if (cg.AArch64)
+                 {
++                    // Keep mPSW. The first use of a CSE that is only tested
++                    // (`if (!p) return; use(p);`) must still CMP. Replacing
++                    // pretregs drops the test, and the following B.cond
++                    // consumes whatever NZCV the caller left.
+                     if ((pretregs & (cg.allregs | INSTR.FLOATREGS)) == 0)
+-                    {
+-                        pretregs = (tyfloating(e.Ety)) ? INSTR.FLOATREGS : cg.allregs;
+-                    }
++                        pretregs |= (tyfloating(e.Ety)) ? INSTR.FLOATREGS : cg.allregs;
+                 }
+                 else if ((pretregs & (mSTACK | mES | ALLREGS | mBP | XMMREGS)) == 0)
+                 {
+diff -ruN dmd-2.113.1/compiler/src/dmd/backend/x86/cod3.d dmd-2.113.1/compiler/src/dmd/backend/x86/cod3.d
+--- dmd-2.113.1/compiler/src/dmd/backend/x86/cod3.d	2026-10-31 15:30:53.000000000 +0100
++++ dmd-2.113.1/compiler/src/dmd/backend/x86/cod3.d	2026-11-02 03:44:38.471871781 +0100
+@@ -1678,6 +1678,12 @@
+             break;
+ 
+         case TYcreal:
++            if (AArch64)
++            {
++                // Two quadruple registers, v0 and v1.
++                ty1 = ty2 = TYreal;
++                break;
++            }
+             if (tyfb == TYjfunc && I32)
+                 break;
+             if (I32)
+@@ -1783,11 +1789,13 @@
+             goto case 4;
+ 
+         case 16:
+-            if (AArch64 && tym == TYreal)
++            if (AArch64 && (tym == TYreal || tym == TYireal))
+                 return rralloc.fpt();
+             goto default;
+ 
+         default:
++            if (AArch64)
++                printf("allocreg unhandled %s size %d\n", tym_str(tym), cast(int)tysize(tym));
+             assert(!AArch64);
+             if (tybasic(tym) == TYreal || tybasic(tym) == TYireal)
+             {
+diff -ruN dmd-2.113.1/compiler/src/dmd/backend/x86/code_x86.d dmd-2.113.1/compiler/src/dmd/backend/x86/code_x86.d
+--- dmd-2.113.1/compiler/src/dmd/backend/x86/code_x86.d	2026-10-31 15:30:53.000000000 +0100
++++ dmd-2.113.1/compiler/src/dmd/backend/x86/code_x86.d	2026-11-02 05:47:04.392889026 +0100
+@@ -298,6 +298,8 @@
+     // AArch64
+     CFadd       = 0x1000_0000,
+     CFfixup     = 0x2000_0000,   // needs a fixup
++    CFgot       = 0x4000_0000,   // ADRP :got: / LDR :got_lo12: (not ADD)
++    CFjump      = 0x8000_0000,   // B, not BL: R_AARCH64_JUMP26
+ }
+ 
+ struct code
+diff -ruN dmd-2.113.1/compiler/src/dmd/dmdparams.d dmd-2.113.1/compiler/src/dmd/dmdparams.d
+--- dmd-2.113.1/compiler/src/dmd/dmdparams.d	2026-10-31 15:30:53.000000000 +0100
++++ dmd-2.113.1/compiler/src/dmd/dmdparams.d	2026-10-31 18:45:30.858120509 +0100
+@@ -326,8 +326,18 @@
+     target.os = defaultTargetOS();
+     target.osMajor = defaultTargetOSMajor();
+     target.cpu = CPU.baseline;
+-    target.isX86_64 = (size_t.sizeof == 8);
+-    target.isX86 = !target.isX86_64;
++    // size_t.sizeof == 8 is also true for AArch64, but that is not x86_64.
++    version (AArch64)
++    {
++        target.isAArch64 = true;
++        target.isX86_64 = false;
++        target.isX86 = false;
++    }
++    else
++    {
++        target.isX86_64 = (size_t.sizeof == 8);
++        target.isX86 = !target.isX86_64;
++    }
+ }
+ 
+ void setTriple(ref Target target, const ref Triple triple) @safe
+diff -ruN dmd-2.113.1/compiler/src/dmd/glue/todt.d dmd-2.113.1/compiler/src/dmd/glue/todt.d
+--- dmd-2.113.1/compiler/src/dmd/glue/todt.d	2026-10-31 15:30:53.000000000 +0100
++++ dmd-2.113.1/compiler/src/dmd/glue/todt.d	2026-11-02 06:53:40.816025332 +0100
+@@ -17,6 +17,7 @@
+ 
+ import dmd.root.array;
+ import dmd.root.complex;
++import dmd.root.ctfloat : real_t;
+ import dmd.root.rmem;
+ 
+ import dmd.glue;
+@@ -230,6 +231,23 @@
+ 
+ /* ================================================================ */
+ 
++/* Linux AArch64 real is IEEE binary128. Host real may be x87. */
++private void writeReal(ref DtBuilder dtb, real_t evalue)
++{
++    if (target.isAArch64 && target.realsize == 16 && target.realpad == 0)
++    {
++        import dmd.root.longdouble : hostRealToIEEE128;
++        ubyte[16] q = void;
++        hostRealToIEEE128(evalue, q);
++        dtb.nbytes(q[]);
++    }
++    else
++    {
++        dtb.nbytes((cast(ubyte*)&evalue)[0 .. target.realsize - target.realpad]);
++        dtb.nzeros(target.realpad);
++    }
++}
++
+ void Expression_toDt(Expression e, ref DtBuilder dtb)
+ {
+     dtb.checkInitialized();
+@@ -347,8 +365,7 @@
+             case Timaginary80:
+             {
+                 auto evalue = e.value;
+-                dtb.nbytes((cast(ubyte*)&evalue)[0 .. target.realsize - target.realpad]);
+-                dtb.nzeros(target.realpad);
++                writeReal(dtb, evalue);
+                 break;
+             }
+ 
+@@ -383,12 +400,8 @@
+ 
+             case Tcomplex80:
+             {
+-                auto evalue = creall(e.value);
+-                dtb.nbytes((cast(ubyte*)&evalue)[0 .. target.realsize - target.realpad]);
+-                dtb.nzeros(target.realpad);
+-                evalue = cimagl(e.value);
+-                dtb.nbytes((cast(ubyte*)&evalue)[0 .. target.realsize - target.realpad]);
+-                dtb.nzeros(target.realpad);
++                writeReal(dtb, creall(e.value));
++                writeReal(dtb, cimagl(e.value));
+                 break;
+             }
+ 
+diff -ruN dmd-2.113.1/compiler/src/dmd/glue/toir.d dmd-2.113.1/compiler/src/dmd/glue/toir.d
+--- dmd-2.113.1/compiler/src/dmd/glue/toir.d	2026-10-31 15:30:53.000000000 +0100
++++ dmd-2.113.1/compiler/src/dmd/glue/toir.d	2026-11-02 03:22:41.548697322 +0100
+@@ -601,7 +601,7 @@
+         if (op == OPbsf || op == OPbsr || op == OPbtc || op == OPbtr || op == OPbts)
+             return NotIntrinsic;        // TODO AArch64
+         if (op == OPcos || op == OPsin || op == OPrint || op == OPsqrt || op == OPscale ||
+-            op == OPrndtol || op == OPyl2xp1 || op == OPtoPrec)
++            op == OPrndtol || op == OPyl2x || op == OPyl2xp1 || op == OPtoPrec)
+             return NotIntrinsic;        // x87 only
+     }
+     return op;
+diff -ruN dmd-2.113.1/compiler/src/dmd/link.d dmd-2.113.1/compiler/src/dmd/link.d
+--- dmd-2.113.1/compiler/src/dmd/link.d	2026-10-31 15:30:53.000000000 +0100
++++ dmd-2.113.1/compiler/src/dmd/link.d	2026-10-31 18:45:30.965634144 +0100
+@@ -443,9 +443,10 @@
+             return STATUS_FAILED;
+         if (driverParams.symdebug)
+             argv.push("-g");
++        // aarch64 cc rejects -m64 and -m32. The native ABI is already LP64.
+         if (target.isX86_64)
+             argv.push("-m64");
+-        else
++        else if (!target.isAArch64)
+             argv.push("-m32");
+         version (OSX)
+         {
+@@ -1165,8 +1166,9 @@
+                 argv.push(p);
+         }
+ 
+-        // Set memory model
+-        argv.push(target.isX86_64 ? "-m64" : "-m32");
++        // Set memory model. aarch64 cpp rejects -m64 and -m32.
++        if (!target.isAArch64)
++            argv.push(target.isX86_64 ? "-m64" : "-m32");
+ 
+         // merge #define's with output
+         argv.push("-dD");       // https://gcc.gnu.org/onlinedocs/cpp/Invocation.html#index-dD
+diff -ruN dmd-2.113.1/compiler/src/dmd/mars.d dmd-2.113.1/compiler/src/dmd/mars.d
+--- dmd-2.113.1/compiler/src/dmd/mars.d	2026-10-31 15:30:53.000000000 +0100
++++ dmd-2.113.1/compiler/src/dmd/mars.d	2026-10-31 18:45:30.865758963 +0100
+@@ -993,9 +993,20 @@
+         }
+         else if (arg == "-m64") // https://dlang.org/dmd.html#switch-m64
+         {
+-            target.isAArch64 = false;
+-            target.isX86    = false;
+-            target.isX86_64 = true;
++            // Makefiles pass -m64 for every 64-bit host. On an AArch64 dmd
++            // that is the native target; -m64 must not select the x86_64 backend.
++            version (AArch64)
++            {
++                target.isAArch64 = true;
++                target.isX86    = false;
++                target.isX86_64 = false;
++            }
++            else
++            {
++                target.isAArch64 = false;
++                target.isX86    = false;
++                target.isX86_64 = true;
++            }
+         }
+         else if (arg == "-m32mscoff") // https://dlang.org/dmd.html#switch-m32mscoff
+         {
+diff -ruN dmd-2.113.1/compiler/src/dmd/root/longdouble.d dmd-2.113.1/compiler/src/dmd/root/longdouble.d
+--- dmd-2.113.1/compiler/src/dmd/root/longdouble.d	2026-10-31 15:30:53.000000000 +0100
++++ dmd-2.113.1/compiler/src/dmd/root/longdouble.d	2026-11-02 06:52:57.975496650 +0100
+@@ -11,6 +11,8 @@
+ 
+ module dmd.root.longdouble;
+ 
++import core.stdc.string : memcpy;
++
+ version (CRuntime_Microsoft)
+ {
+     static if (real.sizeof > 8)
+@@ -23,6 +25,76 @@
+ else
+     alias longdouble = real;
+ 
++/****************************************
++ * Store a host `real` as IEEE binary128 little-endian bytes.
++ * Linux AArch64 long double is binary128. An x86 host `real` is x87
++ * (64-bit explicit mantissa, bias 16383). Copying those 10 bytes makes
++ * `__multf3` read a denormal and return 0. Binary128 uses the same
++ * exponent bias; the explicit integer bit is dropped and the fraction
++ * is placed at the top of the 112-bit field.
++ */
++void hostRealToIEEE128(real x, ref ubyte[16] dst) @trusted nothrow @nogc
++{
++    static if (real.mant_dig == 113 && real.sizeof == 16)
++    {
++        // Host real is already binary128 (LDC on AArch64).
++        memcpy(dst.ptr, &x, 16);
++    }
++    else static if (real.mant_dig == 64)
++    {
++        ubyte[10] raw = void;
++        memcpy(raw.ptr, &x, 10);
++        ulong mant;
++        ushort expSign;
++        memcpy(&mant, raw.ptr, 8);
++        memcpy(&expSign, raw.ptr + 8, 2);
++
++        const uint sign = expSign >> 15;
++        int exp = expSign & 0x7FFF;
++        ulong lo, hi;
++        if (exp == 0x7FFF)
++        {
++            const ulong frac = mant & 0x7FFF_FFFF_FFFF_FFFF;
++            lo = frac << 49;
++            hi = (cast(ulong)sign << 63) | (0x7FFFUL << 48) | (frac >> 15);
++            if (frac)
++                hi |= 1UL << 47;            // quiet NaN
++        }
++        else if (mant == 0)
++        {
++            lo = 0;
++            hi = cast(ulong)sign << 63;     // +0 or -0
++        }
++        else
++        {
++            if (exp == 0)
++                exp = 1;                    // x87 denormal, integer bit clear
++            while (mant && (mant & (1UL << 63)) == 0 && exp > 0)
++            {
++                mant <<= 1;
++                --exp;
++            }
++            if (exp <= 0 || (mant & (1UL << 63)) == 0)
++            {
++                // Smaller than a binary128 normal. Flush; compiler constants
++                // of this magnitude are not produced for the values we emit.
++                lo = 0;
++                hi = cast(ulong)sign << 63;
++            }
++            else
++            {
++                const ulong frac = mant & 0x7FFF_FFFF_FFFF_FFFF;
++                lo = frac << 49;
++                hi = (cast(ulong)sign << 63) | (cast(ulong)exp << 48) | (frac >> 15);
++            }
++        }
++        ulong[2] words = [lo, hi];
++        memcpy(dst.ptr, words.ptr, 16);
++    }
++    else
++        static assert(0, "host real is neither x87 nor binary128");
++}
++
+ // longdouble_soft needed when building the backend with
+ // Visual C or the frontend with LDC on Windows
+ version (CRuntime_Microsoft):
+diff -ruN dmd-2.113.1/compiler/src/dmd/target.d dmd-2.113.1/compiler/src/dmd/target.d
+--- dmd-2.113.1/compiler/src/dmd/target.d	2026-10-31 15:30:53.000000000 +0100
++++ dmd-2.113.1/compiler/src/dmd/target.d	2026-11-02 06:52:57.891495613 +0100
+@@ -490,6 +490,11 @@
+                 realsize = 16;
+                 realpad = 6;
+                 realalignsize = 16;
++                // AArch64 long double is IEEE binary128. Every byte is
++                // significant; the x86 6-byte tail is not padding here.
++                // Comparing or copying only 10 bytes drops the exponent.
++                if (isAArch64)
++                    realpad = 0;
+             }
+         }
+ 
+diff -ruN dmd-2.113.1/compiler/src/osmodel.mak dmd-2.113.1/compiler/src/osmodel.mak
+--- dmd-2.113.1/compiler/src/osmodel.mak	2026-10-31 15:30:53.000000000 +0100
++++ dmd-2.113.1/compiler/src/osmodel.mak	2026-10-31 18:45:30.858120509 +0100
+@@ -98,3 +98,8 @@
+ endif
+ 
+ MODEL_FLAG:=-m$(MODEL)
++# dmd treats -m64 as "x86_64", and aarch64 cc rejects -m64.
++# An AArch64-hosted dmd defaults to AArch64, so pass no model flag.
++ifeq ($(ARCH),aarch64)
++  MODEL_FLAG:=
++endif
+diff -ruN dmd-2.113.1/druntime/src/__importc_builtins.di dmd-2.113.1/druntime/src/__importc_builtins.di
+--- dmd-2.113.1/druntime/src/__importc_builtins.di	2026-10-31 15:30:53.000000000 +0100
++++ dmd-2.113.1/druntime/src/__importc_builtins.di	2026-11-02 04:06:55.891895139 +0100
+@@ -26,8 +26,12 @@
+ 
+ version (Posix)
+ {
++    // va_listType() rewrites __builtin_va_list to __va_list_tag. x86_64 and
++    // AArch64 glibc <stdarg.h> are that builtin; the tag has to be in scope.
+     version (X86_64)
+         alias __va_list_tag = imported!"core.stdc.stdarg".__va_list_tag;
++    else version (AArch64)
++        alias __va_list_tag = imported!"core.stdc.stdarg".__va_list_tag;
+ }
+ 
+ alias __builtin_va_start = imported!"core.stdc.stdarg".va_start;
+diff -ruN dmd-2.113.1/druntime/src/core/internal/atomic.d dmd-2.113.1/druntime/src/core/internal/atomic.d
+--- dmd-2.113.1/druntime/src/core/internal/atomic.d	2026-10-31 15:30:53.000000000 +0100
++++ dmd-2.113.1/druntime/src/core/internal/atomic.d	2026-11-02 03:44:07.665692219 +0100
+@@ -15,28 +15,98 @@
+ version (DigitalMars)
+ version (AArch64)
+ {
+-    /* These functions are all stubbed out. They await someone who knows what
+-       they are doing with AArch64 atomics.
+-       TODO AArch64
++    /* LDXR/STXR helpers. DMD's AArch64 inline assembler is not implemented,
++     * so the instructions live in switch_context_asm.S. Compares are bitwise:
++     * a class reference must not go through opEquals.
+      */
++    extern (C) private pure nothrow @nogc
++    {
++        ubyte dmd_a64_load8(const void* p, int order);
++        ushort dmd_a64_load16(const void* p, int order);
++        uint dmd_a64_load32(const void* p, int order);
++        ulong dmd_a64_load64(const void* p, int order);
++        void dmd_a64_load128(const void* p, void* dst, int order);
++
++        void dmd_a64_store8(void* p, ubyte v, int order);
++        void dmd_a64_store16(void* p, ushort v, int order);
++        void dmd_a64_store32(void* p, uint v, int order);
++        void dmd_a64_store64(void* p, ulong v, int order);
++        void dmd_a64_store128(void* p, const void* v, int order);
++
++        ubyte dmd_a64_add8(void* p, ubyte v, int order);
++        ushort dmd_a64_add16(void* p, ushort v, int order);
++        uint dmd_a64_add32(void* p, uint v, int order);
++        ulong dmd_a64_add64(void* p, ulong v, int order);
++
++        ubyte dmd_a64_xchg8(void* p, ubyte v, int order);
++        ushort dmd_a64_xchg16(void* p, ushort v, int order);
++        uint dmd_a64_xchg32(void* p, uint v, int order);
++        ulong dmd_a64_xchg64(void* p, ulong v, int order);
++        void dmd_a64_xchg128(void* p, const void* v, void* old, int order);
++
++        int dmd_a64_cas8(void* p, void* expected, ubyte desired, int succ, int fail);
++        int dmd_a64_cas16(void* p, void* expected, ushort desired, int succ, int fail);
++        int dmd_a64_cas32(void* p, void* expected, uint desired, int succ, int fail);
++        int dmd_a64_cas64(void* p, void* expected, ulong desired, int succ, int fail);
++        int dmd_a64_cas128(void* p, void* expected, const void* desired, int succ, int fail);
++
++        void dmd_a64_fence(int order);
++        void dmd_a64_pause();
++    }
++
+     enum IsAtomicLockFree(T) = T.sizeof <= size_t.sizeof * 2;
+ 
+     inout(T) atomicLoad(MemoryOrder order = MemoryOrder.seq, T)(inout(T)* src) pure nothrow @nogc @trusted
+         if (CanCAS!T)
+     {
+-        return *src;
++        // Storage plus an inout cast, same shape as the x86 path. A class
++        // reference is copied as bits; comparing it would call opEquals.
++        align(16) void[16] storage = void;
++        static if (T.sizeof == 1)
++            *cast(ubyte*)&storage = dmd_a64_load8(cast(const void*)src, cast(int)order);
++        else static if (T.sizeof == 2)
++            *cast(ushort*)&storage = dmd_a64_load16(cast(const void*)src, cast(int)order);
++        else static if (T.sizeof == 4)
++            *cast(uint*)&storage = dmd_a64_load32(cast(const void*)src, cast(int)order);
++        else static if (T.sizeof == 8)
++            *cast(ulong*)&storage = dmd_a64_load64(cast(const void*)src, cast(int)order);
++        else static if (T.sizeof == 16)
++            dmd_a64_load128(cast(const void*)src, &storage, cast(int)order);
++        else
++            static assert(0, "Unsupported atomic size");
++        return *cast(inout(T)*)&storage;
+     }
+ 
+     void atomicStore(MemoryOrder order = MemoryOrder.seq, T)(T* dest, T value) pure nothrow @nogc @trusted
+         if (CanCAS!T)
+     {
+-        *dest = value;
++        static if (T.sizeof == 1)
++            dmd_a64_store8(cast(void*)dest, *cast(const(ubyte)*)&value, cast(int)order);
++        else static if (T.sizeof == 2)
++            dmd_a64_store16(cast(void*)dest, *cast(const(ushort)*)&value, cast(int)order);
++        else static if (T.sizeof == 4)
++            dmd_a64_store32(cast(void*)dest, *cast(const(uint)*)&value, cast(int)order);
++        else static if (T.sizeof == 8)
++            dmd_a64_store64(cast(void*)dest, *cast(const(ulong)*)&value, cast(int)order);
++        else static if (T.sizeof == 16)
++            dmd_a64_store128(cast(void*)dest, &value, cast(int)order);
++        else
++            static assert(0, "Unsupported atomic size");
+     }
+ 
+     T atomicFetchAdd(MemoryOrder order = MemoryOrder.seq, bool result = true, T)(T* dest, T value) pure nothrow @nogc @trusted
+         if (is(T : ulong))
+     {
+-	return *dest + value;
++        static if (T.sizeof == 1)
++            return cast(T)dmd_a64_add8(cast(void*)dest, cast(ubyte)value, cast(int)order);
++        else static if (T.sizeof == 2)
++            return cast(T)dmd_a64_add16(cast(void*)dest, cast(ushort)value, cast(int)order);
++        else static if (T.sizeof == 4)
++            return cast(T)dmd_a64_add32(cast(void*)dest, cast(uint)value, cast(int)order);
++        else static if (T.sizeof == 8)
++            return cast(T)dmd_a64_add64(cast(void*)dest, cast(ulong)value, cast(int)order);
++        else
++            static assert(0, "Unsupported atomic size");
+     }
+ 
+     T atomicFetchSub(MemoryOrder order = MemoryOrder.seq, bool result = true, T)(T* dest, T value) pure nothrow @nogc @trusted
+@@ -46,9 +116,21 @@
+     }
+ 
+     T atomicExchange(MemoryOrder order = MemoryOrder.seq, bool result = true, T)(T* dest, T value) pure nothrow @nogc @trusted
+-    if (CanCAS!T)
++        if (CanCAS!T)
+     {
+-        size_t storage = void;
++        align(16) void[16] storage = void;
++        static if (T.sizeof == 1)
++            *cast(ubyte*)&storage = dmd_a64_xchg8(cast(void*)dest, *cast(const(ubyte)*)&value, cast(int)order);
++        else static if (T.sizeof == 2)
++            *cast(ushort*)&storage = dmd_a64_xchg16(cast(void*)dest, *cast(const(ushort)*)&value, cast(int)order);
++        else static if (T.sizeof == 4)
++            *cast(uint*)&storage = dmd_a64_xchg32(cast(void*)dest, *cast(const(uint)*)&value, cast(int)order);
++        else static if (T.sizeof == 8)
++            *cast(ulong*)&storage = dmd_a64_xchg64(cast(void*)dest, *cast(const(ulong)*)&value, cast(int)order);
++        else static if (T.sizeof == 16)
++            dmd_a64_xchg128(cast(void*)dest, &value, &storage, cast(int)order);
++        else
++            static assert(0, "Unsupported atomic size");
+         return *cast(T*)&storage;
+     }
+ 
+@@ -57,13 +139,18 @@
+     bool atomicCompareExchangeStrong(MemoryOrder succ = MemoryOrder.seq, MemoryOrder fail = MemoryOrder.seq, T)(T* dest, T* compare, T value) pure nothrow @nogc @trusted
+         if (CanCAS!T)
+     {
+-        if (*dest != *compare)
+-        {
+-            *compare = *dest;
+-            return false;
+-        }
+-        *dest = value;
+-        return true;
++        static if (T.sizeof == 1)
++            return dmd_a64_cas8(cast(void*)dest, cast(void*)compare, *cast(const(ubyte)*)&value, cast(int)succ, cast(int)fail) != 0;
++        else static if (T.sizeof == 2)
++            return dmd_a64_cas16(cast(void*)dest, cast(void*)compare, *cast(const(ushort)*)&value, cast(int)succ, cast(int)fail) != 0;
++        else static if (T.sizeof == 4)
++            return dmd_a64_cas32(cast(void*)dest, cast(void*)compare, *cast(const(uint)*)&value, cast(int)succ, cast(int)fail) != 0;
++        else static if (T.sizeof == 8)
++            return dmd_a64_cas64(cast(void*)dest, cast(void*)compare, *cast(const(ulong)*)&value, cast(int)succ, cast(int)fail) != 0;
++        else static if (T.sizeof == 16)
++            return dmd_a64_cas128(cast(void*)dest, cast(void*)compare, &value, cast(int)succ, cast(int)fail) != 0;
++        else
++            static assert(0, "Unsupported atomic size");
+     }
+ 
+     alias atomicCompareExchangeWeakNoResult = atomicCompareExchangeStrongNoResult;
+@@ -71,14 +158,31 @@
+     bool atomicCompareExchangeStrongNoResult(MemoryOrder succ = MemoryOrder.seq, MemoryOrder fail = MemoryOrder.seq, T)(T* dest, const T compare, T value) pure nothrow @nogc @trusted
+         if (CanCAS!T)
+     {
+-        if (*dest != compare)
+-            return false;
+-        *dest = value;
+-        return true;
++        // Bit copy. `T expected = compare` calls a class's constructor /
++        // refuses const(Mutex) → Mutex, and a struct compare would not be
++        // the bitwise CAS the caller asked for.
++        T expected = void;
++        static if (T.sizeof == 1)
++            *cast(ubyte*)&expected = *cast(const(ubyte)*)&compare;
++        else static if (T.sizeof == 2)
++            *cast(ushort*)&expected = *cast(const(ushort)*)&compare;
++        else static if (T.sizeof == 4)
++            *cast(uint*)&expected = *cast(const(uint)*)&compare;
++        else static if (T.sizeof == 8)
++            *cast(ulong*)&expected = *cast(const(ulong)*)&compare;
++        else static if (T.sizeof == 16)
++        {
++            *cast(ulong*)&expected = *cast(const(ulong)*)&compare;
++            (cast(ulong*)&expected)[1] = (cast(const(ulong)*)&compare)[1];
++        }
++        else
++            static assert(0, "Unsupported atomic size");
++        return atomicCompareExchangeStrong!(succ, fail)(dest, &expected, value);
+     }
+ 
+     void atomicFence(MemoryOrder order = MemoryOrder.seq)() pure nothrow @nogc @trusted
+     {
++        dmd_a64_fence(order);
+     }
+ 
+     void atomicSignalFence(MemoryOrder order = MemoryOrder.seq)() pure nothrow @nogc @trusted
+@@ -88,6 +192,7 @@
+ 
+     void pause() pure nothrow @nogc @trusted
+     {
++        dmd_a64_pause();
+     }
+ }
+ else // X86 and X86_64
+diff -ruN dmd-2.113.1/druntime/src/core/math.d dmd-2.113.1/druntime/src/core/math.d
+--- dmd-2.113.1/druntime/src/core/math.d	2026-10-31 15:30:53.000000000 +0100
++++ dmd-2.113.1/druntime/src/core/math.d	2026-11-02 03:23:37.227911883 +0100
+@@ -31,6 +31,38 @@
+ @safe:
+ 
+ pure:
++
++version (AArch64)
++{
++    /* x87 intrinsics are not emitted on AArch64. Call libm instead.
++     * long double is binary128, so the *l bindings are real, not double.
++     */
++    extern (C) private
++    {
++        pragma(mangle, "cosf") float a64_cosf(float);
++        pragma(mangle, "cos") double a64_cos(double);
++        pragma(mangle, "cosl") real a64_cosl(real);
++        pragma(mangle, "sinf") float a64_sinf(float);
++        pragma(mangle, "sin") double a64_sin(double);
++        pragma(mangle, "sinl") real a64_sinl(real);
++        pragma(mangle, "sqrtf") float a64_sqrtf(float);
++        pragma(mangle, "sqrt") double a64_sqrt(double);
++        pragma(mangle, "sqrtl") real a64_sqrtl(real);
++        pragma(mangle, "ldexpf") float a64_ldexpf(float, int);
++        pragma(mangle, "ldexp") double a64_ldexp(double, int);
++        pragma(mangle, "ldexpl") real a64_ldexpl(real, int);
++        pragma(mangle, "rintf") float a64_rintf(float);
++        pragma(mangle, "rint") double a64_rint(double);
++        pragma(mangle, "rintl") real a64_rintl(real);
++        pragma(mangle, "log2f") float a64_log2f(float);
++        pragma(mangle, "log2") double a64_log2(double);
++        pragma(mangle, "log2l") real a64_log2l(real);
++        pragma(mangle, "llrintf") long a64_llrintf(float);
++        pragma(mangle, "llrint") long a64_llrint(double);
++        pragma(mangle, "llrintl") long a64_llrintl(real);
++    }
++}
++
+ /***********************************
+  * Returns cosine of x. x is in radians.
+  *
+@@ -43,9 +75,18 @@
+  *      Results are undefined if |x| >= $(POWER 2,64).
+  */
+ 
+-float cos(float x);     /* intrinsic */
+-double cos(double x);   /* intrinsic */ /// ditto
+-real cos(real x);       /* intrinsic */ /// ditto
++version (AArch64)
++{
++    float cos(float x) @trusted { return a64_cosf(x); }
++    double cos(double x) @trusted { return a64_cos(x); } /// ditto
++    real cos(real x) @trusted { return a64_cosl(x); } /// ditto
++}
++else
++{
++    float cos(float x);     /* intrinsic */
++    double cos(double x);   /* intrinsic */ /// ditto
++    real cos(real x);       /* intrinsic */ /// ditto
++}
+ 
+ /***********************************
+  * Returns sine of x. x is in radians.
+@@ -60,9 +101,18 @@
+  *      Results are undefined if |x| >= $(POWER 2,64).
+  */
+ 
+-float sin(float x);     /* intrinsic */
+-double sin(double x);   /* intrinsic */ /// ditto
+-real sin(real x);       /* intrinsic */ /// ditto
++version (AArch64)
++{
++    float sin(float x) @trusted { return a64_sinf(x); }
++    double sin(double x) @trusted { return a64_sin(x); } /// ditto
++    real sin(real x) @trusted { return a64_sinl(x); } /// ditto
++}
++else
++{
++    float sin(float x);     /* intrinsic */
++    double sin(double x);   /* intrinsic */ /// ditto
++    real sin(real x);       /* intrinsic */ /// ditto
++}
+ 
+ /*****************************************
+  * Returns x rounded to a long value using the current rounding mode.
+@@ -71,9 +121,18 @@
+  * indeterminate.
+  */
+ 
+-long rndtol(float x);   /* intrinsic */
+-long rndtol(double x);  /* intrinsic */ /// ditto
+-long rndtol(real x);    /* intrinsic */ /// ditto
++version (AArch64)
++{
++    long rndtol(float x) @trusted { return a64_llrintf(x); }
++    long rndtol(double x) @trusted { return a64_llrint(x); } /// ditto
++    long rndtol(real x) @trusted { return a64_llrintl(x); } /// ditto
++}
++else
++{
++    long rndtol(float x);   /* intrinsic */
++    long rndtol(double x);  /* intrinsic */ /// ditto
++    long rndtol(real x);    /* intrinsic */ /// ditto
++}
+ 
+ /***************************************
+  * Compute square root of x.
+@@ -86,18 +145,36 @@
+  *      )
+  */
+ 
+-float sqrt(float x);    /* intrinsic */
+-double sqrt(double x);  /* intrinsic */ /// ditto
+-real sqrt(real x);      /* intrinsic */ /// ditto
++version (AArch64)
++{
++    float sqrt(float x) @trusted { return a64_sqrtf(x); }
++    double sqrt(double x) @trusted { return a64_sqrt(x); } /// ditto
++    real sqrt(real x) @trusted { return a64_sqrtl(x); } /// ditto
++}
++else
++{
++    float sqrt(float x);    /* intrinsic */
++    double sqrt(double x);  /* intrinsic */ /// ditto
++    real sqrt(real x);      /* intrinsic */ /// ditto
++}
+ 
+ /*******************************************
+  * Compute n * 2$(SUPERSCRIPT exp)
+  * References: frexp
+  */
+ 
+-float ldexp(float n, int exp);   /* intrinsic */
+-double ldexp(double n, int exp); /* intrinsic */ /// ditto
+-real ldexp(real n, int exp);     /* intrinsic */ /// ditto
++version (AArch64)
++{
++    float ldexp(float n, int exp) @trusted { return a64_ldexpf(n, exp); }
++    double ldexp(double n, int exp) @trusted { return a64_ldexp(n, exp); } /// ditto
++    real ldexp(real n, int exp) @trusted { return a64_ldexpl(n, exp); } /// ditto
++}
++else
++{
++    float ldexp(float n, int exp);   /* intrinsic */
++    double ldexp(double n, int exp); /* intrinsic */ /// ditto
++    real ldexp(real n, int exp);     /* intrinsic */ /// ditto
++}
+ 
+ unittest {
+     static if (real.mant_dig == 113)
+@@ -154,22 +231,44 @@
+  * $(B nearbyint) performs
+  * the same operation, but does not set the FE_INEXACT exception.
+  */
+-float rint(float x);    /* intrinsic */
+-double rint(double x);  /* intrinsic */ /// ditto
+-real rint(real x);      /* intrinsic */ /// ditto
++version (AArch64)
++{
++    float rint(float x) @trusted { return a64_rintf(x); }
++    double rint(double x) @trusted { return a64_rint(x); } /// ditto
++    real rint(real x) @trusted { return a64_rintl(x); } /// ditto
++}
++else
++{
++    float rint(float x);    /* intrinsic */
++    double rint(double x);  /* intrinsic */ /// ditto
++    real rint(real x);      /* intrinsic */ /// ditto
++}
+ 
+ /***********************************
+  * Building block functions, they
+  * translate to a single x87 instruction.
+  */
+ // y * log2(x)
+-float yl2x(float x, float y);    /* intrinsic */
+-double yl2x(double x, double y);  /* intrinsic */ /// ditto
+-real yl2x(real x, real y);      /* intrinsic */ /// ditto
+-// y * log2(x +1)
+-float yl2xp1(float x, float y);    /* intrinsic */
+-double yl2xp1(double x, double y);  /* intrinsic */ /// ditto
+-real yl2xp1(real x, real y);      /* intrinsic */ /// ditto
++version (AArch64)
++{
++    float yl2x(float x, float y) @trusted { return y * a64_log2f(x); }
++    double yl2x(double x, double y) @trusted { return y * a64_log2(x); } /// ditto
++    real yl2x(real x, real y) @trusted { return y * a64_log2l(x); } /// ditto
++    // y * log2(x + 1)
++    float yl2xp1(float x, float y) @trusted { return y * a64_log2f(x + 1); }
++    double yl2xp1(double x, double y) @trusted { return y * a64_log2(x + 1); } /// ditto
++    real yl2xp1(real x, real y) @trusted { return y * a64_log2l(x + 1); } /// ditto
++}
++else
++{
++    float yl2x(float x, float y);    /* intrinsic */
++    double yl2x(double x, double y);  /* intrinsic */ /// ditto
++    real yl2x(real x, real y);      /* intrinsic */ /// ditto
++    // y * log2(x +1)
++    float yl2xp1(float x, float y);    /* intrinsic */
++    double yl2xp1(double x, double y);  /* intrinsic */ /// ditto
++    real yl2xp1(real x, real y);      /* intrinsic */ /// ditto
++}
+ 
+ unittest
+ {
+diff -ruN dmd-2.113.1/druntime/src/core/thread/fiber/switch_context_asm.S dmd-2.113.1/druntime/src/core/thread/fiber/switch_context_asm.S
+--- dmd-2.113.1/druntime/src/core/thread/fiber/switch_context_asm.S	2026-10-31 15:30:53.000000000 +0100
++++ dmd-2.113.1/druntime/src/core/thread/fiber/switch_context_asm.S	2026-11-02 07:23:28.124050608 +0100
+@@ -24,6 +24,15 @@
+ .section .note.GNU-stack,"",%progbits
+ #endif
+ 
++/* C symbols have a prefix on some targets. GDC defines this; dmd's copy did not. */
++#ifdef __USER_LABEL_PREFIX__
++#define __CONCAT2(a, b) a ## b
++#define __CONCAT(a, b) __CONCAT2(a, b)
++#define CSYM(name) __CONCAT(__USER_LABEL_PREFIX__, name)
++#else
++#define CSYM(name) name
++#endif
++
+ /************************************************************************************
+  * POWER PC ASM BITS
+  ************************************************************************************/
+@@ -563,4 +572,506 @@
+         // fiber_entryPoint never returns
+         bl CSYM(fiber_entryPoint)
+         .cfi_endproc
++
++/*
++ * extern(C) void dmd_a64_callWithStackShell(void* ctx, void* func)
++ * x0 = delegate context, x1 = delegate function.
++ * Spill x19-x29 where the GC stack scan can see them, then call
++ * func(ctx, sp) with the same register convention as extern(D)
++ * void delegate(void* sp): context in x0, sp in x1.
++ */
++        .text
++        .global CSYM(dmd_a64_callWithStackShell)
++        .p2align 2
++#ifndef __APPLE__
++        .type   CSYM(dmd_a64_callWithStackShell), %function
++#endif
++CSYM(dmd_a64_callWithStackShell):
++        sub     sp, sp, #96
++        stp     x19, x20, [sp]
++        stp     x21, x22, [sp, #16]
++        stp     x23, x24, [sp, #32]
++        stp     x25, x26, [sp, #48]
++        stp     x27, x28, [sp, #64]
++        stp     x29, x30, [sp, #80]
++        mov     x16, x1
++        mov     x1, sp
++        blr     x16
++        ldp     x29, x30, [sp, #80]
++        add     sp, sp, #96
++        ret
++
++/* extern(C) void* dmd_a64_sp(); current stack pointer. */
++        .global CSYM(dmd_a64_sp)
++        .p2align 2
++#ifndef __APPLE__
++        .type   CSYM(dmd_a64_sp), %function
++#endif
++CSYM(dmd_a64_sp):
++        mov     x0, sp
++        ret
++#endif
++
++#if defined(__aarch64__)
++/************************************************************************************
++ * AArch64 atomics. ARMv8.0 (no LSE). 16-byte ops use LDXP/STXP and require
++ * 16-byte alignment. MemoryOrder: 0 raw, 2 acq, 3 rel, 4 acq_rel, 5 seq.
++ ************************************************************************************/
++        .text
++        .p2align 2
++
++        .global CSYM(dmd_a64_load8)
++        .type   CSYM(dmd_a64_load8), %function
++CSYM(dmd_a64_load8):
++        cmp     w1, #2
++        b.lo    1f
++        ldarb   w0, [x0]
++        ret
++1:      ldrb    w0, [x0]
++        ret
++
++        .global CSYM(dmd_a64_load16)
++        .type   CSYM(dmd_a64_load16), %function
++CSYM(dmd_a64_load16):
++        cmp     w1, #2
++        b.lo    1f
++        ldarh   w0, [x0]
++        ret
++1:      ldrh    w0, [x0]
++        ret
++
++        .global CSYM(dmd_a64_load32)
++        .type   CSYM(dmd_a64_load32), %function
++CSYM(dmd_a64_load32):
++        cmp     w1, #2
++        b.lo    1f
++        ldar    w0, [x0]
++        ret
++1:      ldr     w0, [x0]
++        ret
++
++        .global CSYM(dmd_a64_load64)
++        .type   CSYM(dmd_a64_load64), %function
++CSYM(dmd_a64_load64):
++        cmp     w1, #2
++        b.lo    1f
++        ldar    x0, [x0]
++        ret
++1:      ldr     x0, [x0]
++        ret
++
++        .global CSYM(dmd_a64_load128)
++        .type   CSYM(dmd_a64_load128), %function
++CSYM(dmd_a64_load128):
++        cmp     w2, #2
++        b.lo    1f
++        ldaxp   x3, x4, [x0]
++        b       2f
++1:      ldxp    x3, x4, [x0]
++2:      clrex
++        stp     x3, x4, [x1]
++        ret
++
++        .global CSYM(dmd_a64_store8)
++        .type   CSYM(dmd_a64_store8), %function
++CSYM(dmd_a64_store8):
++        cmp     w2, #3
++        b.lo    1f
++        stlrb   w1, [x0]
++        ret
++1:      strb    w1, [x0]
++        ret
++
++        .global CSYM(dmd_a64_store16)
++        .type   CSYM(dmd_a64_store16), %function
++CSYM(dmd_a64_store16):
++        cmp     w2, #3
++        b.lo    1f
++        stlrh   w1, [x0]
++        ret
++1:      strh    w1, [x0]
++        ret
++
++        .global CSYM(dmd_a64_store32)
++        .type   CSYM(dmd_a64_store32), %function
++CSYM(dmd_a64_store32):
++        cmp     w2, #3
++        b.lo    1f
++        stlr    w1, [x0]
++        ret
++1:      str     w1, [x0]
++        ret
++
++        .global CSYM(dmd_a64_store64)
++        .type   CSYM(dmd_a64_store64), %function
++CSYM(dmd_a64_store64):
++        cmp     w2, #3
++        b.lo    1f
++        stlr    x1, [x0]
++        ret
++1:      str     x1, [x0]
++        ret
++
++        .global CSYM(dmd_a64_store128)
++        .type   CSYM(dmd_a64_store128), %function
++CSYM(dmd_a64_store128):
++        ldp     x3, x4, [x1]
++        mov     x5, x0
++0:      cmp     w2, #2
++        b.lo    1f
++        ldaxp   x6, x7, [x5]
++        b       2f
++1:      ldxp    x6, x7, [x5]
++2:      cmp     w2, #3
++        b.lo    3f
++        stlxp   w8, x3, x4, [x5]
++        b       4f
++3:      stxp    w8, x3, x4, [x5]
++4:      cbnz    w8, 0b
++        cmp     w2, #5
++        b.ne    5f
++        dmb     ish
++5:      ret
++
++        .global CSYM(dmd_a64_add8)
++        .type   CSYM(dmd_a64_add8), %function
++CSYM(dmd_a64_add8):
++        mov     x3, x0
++0:      cmp     w2, #2
++        b.lo    1f
++        ldaxrb  w0, [x3]
++        b       2f
++1:      ldxrb   w0, [x3]
++2:      add     w4, w0, w1
++        cmp     w2, #3
++        b.lo    3f
++        stlxrb  w5, w4, [x3]
++        b       4f
++3:      stxrb   w5, w4, [x3]
++4:      cbnz    w5, 0b
++        cmp     w2, #5
++        b.ne    5f
++        dmb     ish
++5:      ret
++
++        .global CSYM(dmd_a64_add16)
++        .type   CSYM(dmd_a64_add16), %function
++CSYM(dmd_a64_add16):
++        mov     x3, x0
++0:      cmp     w2, #2
++        b.lo    1f
++        ldaxrh  w0, [x3]
++        b       2f
++1:      ldxrh   w0, [x3]
++2:      add     w4, w0, w1
++        cmp     w2, #3
++        b.lo    3f
++        stlxrh  w5, w4, [x3]
++        b       4f
++3:      stxrh   w5, w4, [x3]
++4:      cbnz    w5, 0b
++        cmp     w2, #5
++        b.ne    5f
++        dmb     ish
++5:      ret
++
++        .global CSYM(dmd_a64_add32)
++        .type   CSYM(dmd_a64_add32), %function
++CSYM(dmd_a64_add32):
++        mov     x3, x0
++0:      cmp     w2, #2
++        b.lo    1f
++        ldaxr   w0, [x3]
++        b       2f
++1:      ldxr    w0, [x3]
++2:      add     w4, w0, w1
++        cmp     w2, #3
++        b.lo    3f
++        stlxr   w5, w4, [x3]
++        b       4f
++3:      stxr    w5, w4, [x3]
++4:      cbnz    w5, 0b
++        cmp     w2, #5
++        b.ne    5f
++        dmb     ish
++5:      ret
++
++        .global CSYM(dmd_a64_add64)
++        .type   CSYM(dmd_a64_add64), %function
++CSYM(dmd_a64_add64):
++        mov     x3, x0
++0:      cmp     w2, #2
++        b.lo    1f
++        ldaxr   x0, [x3]
++        b       2f
++1:      ldxr    x0, [x3]
++2:      add     x4, x0, x1
++        cmp     w2, #3
++        b.lo    3f
++        stlxr   w5, x4, [x3]
++        b       4f
++3:      stxr    w5, x4, [x3]
++4:      cbnz    w5, 0b
++        cmp     w2, #5
++        b.ne    5f
++        dmb     ish
++5:      ret
++
++        .global CSYM(dmd_a64_xchg8)
++        .type   CSYM(dmd_a64_xchg8), %function
++CSYM(dmd_a64_xchg8):
++        mov     x3, x0
++0:      cmp     w2, #2
++        b.lo    1f
++        ldaxrb  w0, [x3]
++        b       2f
++1:      ldxrb   w0, [x3]
++2:      cmp     w2, #3
++        b.lo    3f
++        stlxrb  w5, w1, [x3]
++        b       4f
++3:      stxrb   w5, w1, [x3]
++4:      cbnz    w5, 0b
++        cmp     w2, #5
++        b.ne    5f
++        dmb     ish
++5:      ret
++
++        .global CSYM(dmd_a64_xchg16)
++        .type   CSYM(dmd_a64_xchg16), %function
++CSYM(dmd_a64_xchg16):
++        mov     x3, x0
++0:      cmp     w2, #2
++        b.lo    1f
++        ldaxrh  w0, [x3]
++        b       2f
++1:      ldxrh   w0, [x3]
++2:      cmp     w2, #3
++        b.lo    3f
++        stlxrh  w5, w1, [x3]
++        b       4f
++3:      stxrh   w5, w1, [x3]
++4:      cbnz    w5, 0b
++        cmp     w2, #5
++        b.ne    5f
++        dmb     ish
++5:      ret
++
++        .global CSYM(dmd_a64_xchg32)
++        .type   CSYM(dmd_a64_xchg32), %function
++CSYM(dmd_a64_xchg32):
++        mov     x3, x0
++0:      cmp     w2, #2
++        b.lo    1f
++        ldaxr   w0, [x3]
++        b       2f
++1:      ldxr    w0, [x3]
++2:      cmp     w2, #3
++        b.lo    3f
++        stlxr   w5, w1, [x3]
++        b       4f
++3:      stxr    w5, w1, [x3]
++4:      cbnz    w5, 0b
++        cmp     w2, #5
++        b.ne    5f
++        dmb     ish
++5:      ret
++
++        .global CSYM(dmd_a64_xchg64)
++        .type   CSYM(dmd_a64_xchg64), %function
++CSYM(dmd_a64_xchg64):
++        mov     x3, x0
++0:      cmp     w2, #2
++        b.lo    1f
++        ldaxr   x0, [x3]
++        b       2f
++1:      ldxr    x0, [x3]
++2:      cmp     w2, #3
++        b.lo    3f
++        stlxr   w5, x1, [x3]
++        b       4f
++3:      stxr    w5, x1, [x3]
++4:      cbnz    w5, 0b
++        cmp     w2, #5
++        b.ne    5f
++        dmb     ish
++5:      ret
++
++        .global CSYM(dmd_a64_xchg128)
++        .type   CSYM(dmd_a64_xchg128), %function
++CSYM(dmd_a64_xchg128):
++        ldp     x4, x5, [x1]
++        mov     x6, x0
++0:      cmp     w3, #2
++        b.lo    1f
++        ldaxp   x7, x8, [x6]
++        b       2f
++1:      ldxp    x7, x8, [x6]
++2:      cmp     w3, #3
++        b.lo    3f
++        stlxp   w9, x4, x5, [x6]
++        b       4f
++3:      stxp    w9, x4, x5, [x6]
++4:      cbnz    w9, 0b
++        stp     x7, x8, [x2]
++        cmp     w3, #5
++        b.ne    5f
++        dmb     ish
++5:      ret
++
++        .global CSYM(dmd_a64_cas8)
++        .type   CSYM(dmd_a64_cas8), %function
++CSYM(dmd_a64_cas8):
++        ldrb    w5, [x1]
++        mov     x6, x0
++0:      cmp     w3, #2
++        b.lo    1f
++        ldaxrb  w7, [x6]
++        b       2f
++1:      ldxrb   w7, [x6]
++2:      cmp     w7, w5
++        b.ne    8f
++        cmp     w3, #3
++        b.lo    3f
++        stlxrb  w8, w2, [x6]
++        b       4f
++3:      stxrb   w8, w2, [x6]
++4:      cbnz    w8, 0b
++        cmp     w3, #5
++        b.ne    5f
++        dmb     ish
++5:      mov     x0, #1
++        ret
++8:      clrex
++        strb    w7, [x1]
++        mov     x0, #0
++        ret
++
++        .global CSYM(dmd_a64_cas16)
++        .type   CSYM(dmd_a64_cas16), %function
++CSYM(dmd_a64_cas16):
++        ldrh    w5, [x1]
++        mov     x6, x0
++0:      cmp     w3, #2
++        b.lo    1f
++        ldaxrh  w7, [x6]
++        b       2f
++1:      ldxrh   w7, [x6]
++2:      cmp     w7, w5
++        b.ne    8f
++        cmp     w3, #3
++        b.lo    3f
++        stlxrh  w8, w2, [x6]
++        b       4f
++3:      stxrh   w8, w2, [x6]
++4:      cbnz    w8, 0b
++        cmp     w3, #5
++        b.ne    5f
++        dmb     ish
++5:      mov     x0, #1
++        ret
++8:      clrex
++        strh    w7, [x1]
++        mov     x0, #0
++        ret
++
++        .global CSYM(dmd_a64_cas32)
++        .type   CSYM(dmd_a64_cas32), %function
++CSYM(dmd_a64_cas32):
++        ldr     w5, [x1]
++        mov     x6, x0
++0:      cmp     w3, #2
++        b.lo    1f
++        ldaxr   w7, [x6]
++        b       2f
++1:      ldxr    w7, [x6]
++2:      cmp     w7, w5
++        b.ne    8f
++        cmp     w3, #3
++        b.lo    3f
++        stlxr   w8, w2, [x6]
++        b       4f
++3:      stxr    w8, w2, [x6]
++4:      cbnz    w8, 0b
++        cmp     w3, #5
++        b.ne    5f
++        dmb     ish
++5:      mov     x0, #1
++        ret
++8:      clrex
++        str     w7, [x1]
++        mov     x0, #0
++        ret
++
++        .global CSYM(dmd_a64_cas64)
++        .type   CSYM(dmd_a64_cas64), %function
++CSYM(dmd_a64_cas64):
++        ldr     x5, [x1]
++        mov     x6, x0
++0:      cmp     w3, #2
++        b.lo    1f
++        ldaxr   x7, [x6]
++        b       2f
++1:      ldxr    x7, [x6]
++2:      cmp     x7, x5
++        b.ne    8f
++        cmp     w3, #3
++        b.lo    3f
++        stlxr   w8, x2, [x6]
++        b       4f
++3:      stxr    w8, x2, [x6]
++4:      cbnz    w8, 0b
++        cmp     w3, #5
++        b.ne    5f
++        dmb     ish
++5:      mov     x0, #1
++        ret
++8:      clrex
++        str     x7, [x1]
++        mov     x0, #0
++        ret
++
++        .global CSYM(dmd_a64_cas128)
++        .type   CSYM(dmd_a64_cas128), %function
++CSYM(dmd_a64_cas128):
++        ldp     x5, x6, [x1]
++        ldp     x7, x8, [x2]
++        mov     x9, x0
++0:      cmp     w3, #2
++        b.lo    1f
++        ldaxp   x10, x11, [x9]
++        b       2f
++1:      ldxp    x10, x11, [x9]
++2:      cmp     x10, x5
++        b.ne    8f
++        cmp     x11, x6
++        b.ne    8f
++        cmp     w3, #3
++        b.lo    3f
++        stlxp   w12, x7, x8, [x9]
++        b       4f
++3:      stxp    w12, x7, x8, [x9]
++4:      cbnz    w12, 0b
++        cmp     w3, #5
++        b.ne    5f
++        dmb     ish
++5:      mov     x0, #1
++        ret
++8:      clrex
++        stp     x10, x11, [x1]
++        mov     x0, #0
++        ret
++
++        .global CSYM(dmd_a64_fence)
++        .type   CSYM(dmd_a64_fence), %function
++CSYM(dmd_a64_fence):
++        cbz     w0, 1f
++        dmb     ish
++1:      ret
++
++        .global CSYM(dmd_a64_pause)
++        .type   CSYM(dmd_a64_pause), %function
++CSYM(dmd_a64_pause):
++        yield
++        ret
+ #endif
+diff -ruN dmd-2.113.1/druntime/src/core/thread/osthread.d dmd-2.113.1/druntime/src/core/thread/osthread.d
+--- dmd-2.113.1/druntime/src/core/thread/osthread.d	2026-10-31 15:30:53.000000000 +0100
++++ dmd-2.113.1/druntime/src/core/thread/osthread.d	2026-11-02 07:23:53.417670823 +0100
+@@ -1363,6 +1363,14 @@
+ }
+ 
+ 
++// DMD has no AArch64 inline assembler. These save the callee-saved
++// registers and read SP. See switch_context_asm.S.
++version (AArch64)
++{
++extern(C) void dmd_a64_callWithStackShell(void* ctx, void* func) nothrow @nogc;
++extern(C) void* dmd_a64_sp() nothrow @nogc;
++}
++
+ // Calls the given delegate, passing the current thread's stack pointer to it.
+ package extern(D) void callWithStackShell(scope callWithStackShellDg fn) nothrow
+ in (fn)
+@@ -1531,24 +1539,11 @@
+     }
+     else version (AArch64)
+     {
+-	// Callee-save registers, x19-x28 according to AAPCS64, section
+-	// 5.1.1.  Include x29 fp because it optionally can be a callee
+-	// saved reg
+-	size_t[11] regs = void;
+-	// store the registers in pairs
+-	asm pure nothrow @nogc
+-	{
+-	/*
+-	    stp x19, x20, regs[0];
+-	    stp x21, x22, regs[2];
+-	    stp x23, x24, regs[4];
+-	    stp x25, x26, regs[6];
+-	    stp x27, x28, regs[8];
+-	    str x29, regs[10];
+-	    mov [sp], sp;
+-	 */
+-	}
+-	assert(0, "implement AArch64 inline assembler for callWithStackShell()"); // TODO AArch64
++	// Spill callee-saves and call fn(sp). extern(C): x0 is the
++	// delegate context, x1 the function. Returning skips fn(sp) below,
++	// which would run with an uninitialized stack pointer.
++	dmd_a64_callWithStackShell(fn.ptr, cast(void*) fn.funcptr);
++	return;
+     }
+     else
+     {
+@@ -1600,10 +1595,7 @@
+     else version (D_InlineAsm_X86_64)
+         asm pure nothrow @nogc { naked; mov RAX, RSP; ret; }
+     else version (AArch64)
+-        //asm pure nothrow @nogc { naked; mov x0, SP; ret; }    // TODO AArch64
+-    {
+-        return null;
+-    }
++        return dmd_a64_sp();
+     else version (GNU)
+         return __builtin_frame_address(0);
+     else
