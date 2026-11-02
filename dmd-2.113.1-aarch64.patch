@@ -1287,7 +1287,7 @@ diff -ruN dmd-2.113.1/compiler/src/dmd/backend/x86/cgcod.d dmd-2.113.1/compiler/
                  {
 diff -ruN dmd-2.113.1/compiler/src/dmd/backend/x86/cod3.d dmd-2.113.1/compiler/src/dmd/backend/x86/cod3.d
 --- dmd-2.113.1/compiler/src/dmd/backend/x86/cod3.d	2026-10-31 15:30:53.000000000 +0100
-+++ dmd-2.113.1/compiler/src/dmd/backend/x86/cod3.d	2026-11-02 03:44:38.471871781 +0100
++++ dmd-2.113.1/compiler/src/dmd/backend/x86/cod3.d	2026-11-02 07:44:09.553437098 +0100
 @@ -1678,6 +1678,12 @@
              break;
  
@@ -1316,6 +1316,70 @@ diff -ruN dmd-2.113.1/compiler/src/dmd/backend/x86/cod3.d dmd-2.113.1/compiler/s
              assert(!AArch64);
              if (tybasic(tym) == TYreal || tybasic(tym) == TYireal)
              {
+@@ -4823,6 +4831,63 @@
+         }
+         // MOV reg,param[BP]
+         //assert(refparam);
++        if (cgstate.AArch64)
++        {
++            // XMM0 is register 16, which is x16 here. The x86 XMM test
++            // below calls xmmload(TYucent) and aborts. Match arm/cod3.d's
++            // FL.para fixup: [fp, #Soffset + localsize + 16].
++            int off = cast(int)s.Soffset + cast(int)cgstate.BPoff * 2;
++            if (cgstate.hasframe)
++                off += cast(int)(REGSIZE * 2);
++            off += cast(int)localsize;
++            const reg_t base = cgstate.hasframe ? 29 : 31;
++
++            void loadGpr(reg_t rt, int disp, uint bytes)
++            {
++                const ulong u = cast(ulong)disp;
++                if (bytes <= 1 && disp >= 0 && disp < 0x1000)
++                    cdb.gen1(INSTR.ldrb_imm(1, rt, base, u));
++                else if (bytes == 2 && disp >= 0 && (disp & 1) == 0 && (disp >> 1) < 0x1000)
++                    cdb.gen1(INSTR.ldst_pos(1, 0, 1, cast(uint)disp >> 1, base, rt));
++                else if (bytes == 4 && disp >= 0 && (disp & 3) == 0 && (disp >> 2) < 0x1000)
++                    cdb.gen1(INSTR.ldr_imm_gen(0, rt, base, u));
++                else if (bytes >= 8 && disp >= 0 && (disp & 7) == 0 && (disp >> 3) < 0x1000)
++                    cdb.gen1(INSTR.ldr_imm_gen(1, rt, base, u));
++                else
++                {
++                    // Indexed LDR. x16/x17 are inter-procedural scratch.
++                    const reg_t idx = (rt == 16) ? 17 : 16;
++                    movregconst(cdb, idx, cast(targ_size_t)disp, 0);
++                    const uint is64 = bytes >= 8;
++                    cdb.gen1(INSTR.ldr_reg_gen(is64, idx, 3, 0, base, rt));
++                }
++            }
++
++            if (tyfloating(s.Stype.Tty) || (s.Sreglsw >= 32 && s.Sreglsw != NOREG))
++            {
++                uint size, opc;
++                uint lsz = sz;
++                if (tycomplex(s.Stype.Tty))
++                    lsz /= 2;
++                INSTR.szToSizeOpcStr(lsz, size, opc);
++                const uint shift = lsz == 16 ? 4 : lsz == 8 ? 3 : lsz == 4 ? 2 : lsz == 2 ? 1 : 0;
++                assert(off >= 0 && (off & ((1 << shift) - 1)) == 0);
++                const uint imm12 = cast(uint)off >> shift;
++                assert(imm12 < 0x1000);
++                cdb.gen1(INSTR.ldr_imm_fpsimd(size, opc, imm12, base, s.Sreglsw));
++                if (tycomplex(s.Stype.Tty))
++                    cdb.gen1(INSTR.ldr_imm_fpsimd(size, opc, imm12 + 1, base, s.Sregmsw));
++            }
++            else if (sz > REGSIZE)
++            {
++                loadGpr(s.Sreglsw, off, REGSIZE);
++                if (s.Sregmsw != NOREG)
++                    loadGpr(s.Sregmsw, off + cast(int)REGSIZE, REGSIZE);
++            }
++            else
++                loadGpr(s.Sreglsw, off, sz);
++            continue;
++        }
+         if (mask(s.Sreglsw) & XMMREGS)
+         {
+             const op = xmmload(s.Stype.Tty);  // MOVSS/D xreg,mem
 diff -ruN dmd-2.113.1/compiler/src/dmd/backend/x86/code_x86.d dmd-2.113.1/compiler/src/dmd/backend/x86/code_x86.d
 --- dmd-2.113.1/compiler/src/dmd/backend/x86/code_x86.d	2026-10-31 15:30:53.000000000 +0100
 +++ dmd-2.113.1/compiler/src/dmd/backend/x86/code_x86.d	2026-11-02 05:47:04.392889026 +0100
