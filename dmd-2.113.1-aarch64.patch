@@ -414,8 +414,8 @@ diff -ruN dmd-2.113.1/compiler/src/dmd/backend/arm/cod1.d dmd-2.113.1/compiler/s
          //printf("xyzzy1 %s %d %d\n", e.Vsym.Sident.ptr, cast(int)cgstate.regcon.params, regParamInPreg(e.Vsym));
          if (cgstate.regcon.params &&
 diff -ruN dmd-2.113.1/compiler/src/dmd/backend/arm/cod2.d dmd-2.113.1/compiler/src/dmd/backend/arm/cod2.d
---- dmd-2.113.1/compiler/src/dmd/backend/arm/cod2.d	2026-10-31 15:30:53.000000000 +0100
-+++ dmd-2.113.1/compiler/src/dmd/backend/arm/cod2.d	2026-11-02 18:05:00.310081390 +0100
+--- dmd-2.113.1/compiler/src/dmd/backend/arm/cod2.d
++++ dmd-2.113.1/compiler/src/dmd/backend/arm/cod2.d
 @@ -163,7 +163,8 @@
                  default:
                      assert(0);
@@ -762,7 +762,19 @@ diff -ruN dmd-2.113.1/compiler/src/dmd/backend/arm/cod2.d dmd-2.113.1/compiler/s
              uint sf = 1, opc = 0;
              cdb.gen1(INSTR.log_imm(sf,opc,N,immr,imms,Xn,Xn)); // https://www.scs.stanford.edu/~zyedidia/arm64/eor_log_imm.html
              cdb.gen1(INSTR.fmov_float_gen(1,2,1,7,Xn,Vn)); // 64-bit to top half of 128-bit
-@@ -2595,8 +2707,9 @@
+@@ -2532,7 +2644,10 @@
+     op = 1;
+     S = 0;
+     uint Rm = Rn;
+-    uint cond = 0xA ^ 1; // LT
++    // CNEG Rd,Rn,LT is an alias of CSNEG Rd,Rn,Rn,invert(LT).
++    // The cond field must be GE (0xA). XOR 1 stores LT and objdump
++    // prints `cneg Rd, Rn, ge`, which negates non-negative values.
++    uint cond = 0xA; // GE == invert(LT)
+     uint o2 = 1;
+     ins = (sf     << 31) |
+           (op     << 30) |
+@@ -2595,8 +2710,9 @@
      {
          gentstreg(cdb,cs.reg,sz == 8);          // CMP cs.reg,#0
  
@@ -774,7 +786,7 @@ diff -ruN dmd-2.113.1/compiler/src/dmd/backend/arm/cod2.d dmd-2.113.1/compiler/s
  
          const n = e2.Vint;
          uint opx = e.Eoper == OPpostinc ? 0 : 1;
-@@ -2624,8 +2737,12 @@
+@@ -2624,8 +2740,12 @@
              pretregs &= ~mPSW;
          }
  
@@ -790,8 +802,8 @@ diff -ruN dmd-2.113.1/compiler/src/dmd/backend/arm/cod2.d dmd-2.113.1/compiler/s
          const n = e2.Vint;
          uint opx = e.Eoper == OPpostinc ? 0 : 1;
 diff -ruN dmd-2.113.1/compiler/src/dmd/backend/arm/cod3.d dmd-2.113.1/compiler/src/dmd/backend/arm/cod3.d
---- dmd-2.113.1/compiler/src/dmd/backend/arm/cod3.d	2026-10-31 15:30:53.000000000 +0100
-+++ dmd-2.113.1/compiler/src/dmd/backend/arm/cod3.d	2026-11-02 10:49:57.238471934 +0100
+--- dmd-2.113.1/compiler/src/dmd/backend/arm/cod3.d
++++ dmd-2.113.1/compiler/src/dmd/backend/arm/cod3.d
 @@ -30,7 +30,10 @@
  import dmd.backend.cdef;
  import dmd.backend.cgcse;
@@ -804,7 +816,54 @@ diff -ruN dmd-2.113.1/compiler/src/dmd/backend/arm/cod3.d dmd-2.113.1/compiler/s
  import dmd.backend.arm.disasmarm : encodeHFD;
  import dmd.backend.x86.cgcod : disassemble;
  import dmd.backend.x86.code_x86;
-@@ -242,6 +245,9 @@
+@@ -69,11 +72,23 @@
+ void REGSAVE_save(ref REGSAVE regsave, ref CodeBuilder cdb, reg_t reg, out uint idx)
+ {
+     //printf("REGSAVE_save() %s\n", regm_str(mask(reg)));
+-    // TODO AArch64 do 128 bit registers
+-    if (!regsave.alignment)
+-        regsave.alignment = REGSIZE;
+-    idx = regsave.idx;
+-    regsave.idx += REGSIZE;
++    // A v register can hold a binary128 real. An 8-byte spill drops the
++    // exponent, so the value reloads as a denormal and a live real across
++    // a call is lost. Save the whole 16 bytes, 16-aligned, like XMM.
++    if (mask(reg) & INSTR.FLOATREGS)
++    {
++        regsave.alignment = 16;
++        regsave.idx = (regsave.idx + 15) & ~15;
++        idx = regsave.idx;
++        regsave.idx += 16;
++    }
++    else
++    {
++        if (!regsave.alignment)
++            regsave.alignment = REGSIZE;
++        idx = regsave.idx;
++        regsave.idx += REGSIZE;
++    }
+ 
+     // STR reg, [BP, #idx]
+     code cs;
+@@ -84,7 +99,7 @@
+     if (mask(reg) & INSTR.FLOATREGS)
+     {
+         uint imm12 = idx;
+-        uint sz = 8;
++        uint sz = 16;
+         uint size, opc;
+         INSTR.szToSizeOpcStr(sz, size, opc);
+         imm12 /= sz;
+@@ -117,7 +132,7 @@
+     if (mask(reg) & INSTR.FLOATREGS)
+     {
+         uint imm12 = idx;
+-        uint sz = 8;
++        uint sz = 16;
+         uint size, opc;
+         INSTR.szToSizeOpcLdr(sz, size, opc);
+         imm12 /= sz;
+@@ -242,6 +257,9 @@
  bool isBranch(uint ins) { return ((ins & 0xFF00_0000) == 0x5400_0000) ||
                                   ((ins & 0x7E00_0000) == 0x3400_0000); }
  
@@ -814,7 +873,7 @@ diff -ruN dmd-2.113.1/compiler/src/dmd/backend/arm/cod3.d dmd-2.113.1/compiler/s
  enum MARS = true;
  
  // outswitab
-@@ -371,7 +377,17 @@
+@@ -371,7 +389,17 @@
      cs.Sextend = 0;
      cs.IEV1.Vsym = null;
      cs.IEV1.Voffset = slot;
@@ -833,7 +892,62 @@ diff -ruN dmd-2.113.1/compiler/src/dmd/backend/arm/cod3.d dmd-2.113.1/compiler/s
      assert(cs.Iop);
      cdb.gen(&cs);
  }
-@@ -533,13 +549,16 @@
+@@ -488,6 +516,26 @@
+ // prolog_setupalloca
+ 
+ /**************************************
++ * First callee-saved slot, and the register it is addressed from.
++ *
++ * `pushoff` is an x86 BP-relative offset (negative). x29 is the bottom
++ * of the AArch64 frame, with the saved x29/x30 pair below the locals,
++ * so the same translation assignaddrc uses for FL.auto_ applies:
++ * x29_offset = bp_offset + localsize + 16. The prologue leaves SP == X29,
++ * and assignaddrc does not add EBPtoESP when it rewrites those addresses
++ * as SP-relative. Adding EBPtoESP here stores the registers at
++ * [SP, #framesize], which is the caller's frame.
++ */
++@trusted
++private void calleeSaveSlot(ref CGstate cg, out targ_size_t gpoffset, out reg_t fp)
++{
++    gpoffset = cg.pushoff + cg.BPoff + localsize;
++    if (cg.hasframe)
++        gpoffset += REGSIZE * 2;
++    fp = (!cg.hasframe || cg.enforcealign) ? INSTR.SP : INSTR.BP;
++}
++
++/**************************************
+  * Save registers that the function destroys,
+  * but that the ABI says should be preserved across
+  * function calls.
+@@ -499,7 +547,6 @@
+  *      topush = mask of registers to push
+  *      cfa_offset = offset of frame pointer from CFA
+  */
+-
+ @trusted
+ void prolog_saveregs(ref CGstate cg, ref CodeBuilder cdb, regm_t topush, int cfa_offset)
+ {
+@@ -511,16 +558,9 @@
+     // Save to preallocated section in the stack frame
+     int xmmtopush = 0;
+     int gptopush = popcnt(topush);  // general purpose registers to save
+-    //targ_size_t gpoffset = cg.pushoff + cg.BPoff + localsize;
+-    targ_size_t gpoffset = 8 + 8;   // skip over x29,x30
+-    reg_t fp;                       // frame pointer
+-    if (!cg.hasframe || cg.enforcealign)
+-    {
+-        gpoffset += cg.EBPtoESP;
+-        fp = INSTR.SP;        // SP
+-    }
+-    else
+-        fp = INSTR.BP;        // BP
++    targ_size_t gpoffset;
++    reg_t fp;
++    calleeSaveSlot(cg, gpoffset, fp);
+ 
+     while (topush)
+     {
+@@ -533,13 +573,16 @@
              : INSTR.str_imm_gen(1, reg, fp, gpoffset);            // STR reg,[fp,#offset]
          cdb.gen1(ins);
  
@@ -853,7 +967,31 @@ diff -ruN dmd-2.113.1/compiler/src/dmd/backend/arm/cod3.d dmd-2.113.1/compiler/s
              dwarf_CFA_offset(reg, cast(int)(gpoffset - cfa_offset));
              cdb.reset();
              cdb.append(c);
-@@ -1016,7 +1035,7 @@
+@@ -560,20 +603,12 @@
+ 
+     assert(cg.pushoffuse || !topop);
+ 
+-    // Save to preallocated section in the stack frame
++    // Restore from the same slots prolog_saveregs() wrote.
+     int xmmtopop = popcnt(topop & XMMREGS);   // XMM regs take 16 bytes
+     int gptopop = popcnt(topop);   // general purpose registers to save
+-    //targ_size_t gpoffset = cg.pushoff + cg.BPoff + localsize;
+-    targ_size_t gpoffset = 8 + 8; // skip over x29,x30
+-
++    targ_size_t gpoffset;
+     reg_t fp;
+-    if (!cg.hasframe || cg.enforcealign)
+-    {
+-        gpoffset += cg.EBPtoESP;
+-        fp = 31;        // SP
+-    }
+-    else
+-        fp = 29;        // BP
++    calleeSaveSlot(cg, gpoffset, fp);
+ 
+     while (topop)
+     {
+@@ -1016,7 +1051,7 @@
                  genregs(cdbx,0x39,SP,BP);                             // CMP EBP,ESP
                  if (I64)
                      code_orrex(cdbx.last(),REX_W);
@@ -862,7 +1000,7 @@ diff -ruN dmd-2.113.1/compiler/src/dmd/backend/arm/cod3.d dmd-2.113.1/compiler/s
                  // explicitly mark as short jump, needed for correct retsize calculation (Bugzilla 15779)
                  cdbx.last().Iflags &= ~CFjmp16;
                  cdbx.gen1(0x58 + BP);                                 // POP BP
-@@ -1030,8 +1049,12 @@
+@@ -1030,8 +1065,12 @@
              else
              {
                  if (log) printf("epilog: mov sp,bp\n");
@@ -877,7 +1015,7 @@ diff -ruN dmd-2.113.1/compiler/src/dmd/backend/arm/cod3.d dmd-2.113.1/compiler/s
                  else
                  {
                      /* LDP x29,x30,[sp] https://www.scs.stanford.edu/~zyedidia/arm64/ldp_gen.html
-@@ -1224,8 +1247,12 @@
+@@ -1224,8 +1263,12 @@
              cdb.append(c1);
          }
      }
@@ -892,7 +1030,7 @@ diff -ruN dmd-2.113.1/compiler/src/dmd/backend/arm/cod3.d dmd-2.113.1/compiler/s
  
      thunkoffset = Offset(seg);
      code* c = cdb.finish();
-@@ -1449,22 +1476,32 @@
+@@ -1449,22 +1492,32 @@
          }
          else // one or both are floating point registers
          {
@@ -937,7 +1075,7 @@ diff -ruN dmd-2.113.1/compiler/src/dmd/backend/arm/cod3.d dmd-2.113.1/compiler/s
          }
      }
  }
-@@ -1747,14 +1784,21 @@
+@@ -1747,14 +1800,21 @@
                      //printf("fix ESP\n");
                      if (cgstate.hasframe)
                      {
@@ -962,7 +1100,7 @@ diff -ruN dmd-2.113.1/compiler/src/dmd/backend/arm/cod3.d dmd-2.113.1/compiler/s
  
                              cn.next = c.next;
                              c.next = cn;
-@@ -1907,7 +1951,7 @@
+@@ -1907,7 +1967,7 @@
  
              case FL.allocatmp:
                  offset = c.IEV1.Vpointer + cgstate.Alloca.offset + cgstate.BPoff;
@@ -971,7 +1109,94 @@ diff -ruN dmd-2.113.1/compiler/src/dmd/backend/arm/cod3.d dmd-2.113.1/compiler/s
  
              case FL.funcarg:
                  offset = c.IEV1.Vpointer + cgstate.funcarg.offset + cgstate.BPoff;
-@@ -2298,6 +2342,14 @@
+@@ -1963,7 +2023,14 @@
+ 
+                 reg_t Rn = cast(reg_t)field(ins,9,5);
+                 reg_t Rt = cast(reg_t)field(ins,4,0);
+-                if (Rn == 29 && !cgstate.hasframe || (cgstate.enforcealign && c.IFL1 != FL.para))
++                // `&&` binds tighter than `||`. The old form
++                // `(Rn == 29 && !hasframe) || (enforcealign && IFL1 != FL.para)`
++                // turned every base into SP whenever the frame was realigned.
++                // A store through a pointer (`str s0, [x1, #4]`) became
++                // `str s0, [sp, #4]` and overwrote the saved x29/x30 pair.
++                // Only X29 is a frame address. SP stays equal to X29: the
++                // prologue does not AND SP, so EBPtoESP is not added.
++                if (Rn == 29 && (!cgstate.hasframe || (cgstate.enforcealign && c.IFL1 != FL.para)))
+                 {   /* Convert to SP relative address instead of BP */
+                     //offset += cgstate.EBPtoESP;       // add difference in offset
+                     Rn = 31;
+@@ -2020,23 +2087,60 @@
+                         else
+                         {
+                         Lextra:
+-                            // insert extra instruction to load the offset using scratch register R16
++                            // The scaled unsigned immediate cannot express this
++                            // byte offset. The misaligned path (>= 256, not a
++                            // multiple of the access) arrives here with imm12
++                            // still the placeholder, so shifting that yields
++                            // `add x16,x29,#0,lsl #12` and a store at [x16],
++                            // which overwrites the saved frame record.
++                            // Add the byte offset itself. An aligned offset
++                            // that does not fit is split into a page add plus
++                            // a scaled low part; a misaligned one is added in
++                            // full and accessed at [R16].
+                             enum R16 = 16;              // scratch register
+-                            // add R16,Rn,(imm12 >> 12) << 12 // https://www.scs.stanford.edu/~zyedidia/arm64/add_addsub_imm.html
+                             const reg_t Rn2 = cast(reg_t)field(ins,9,5);
+-                            uint ins2 = INSTR.add_addsub_imm(1,1,imm12>>12,Rn2,R16);
+-                            c.Iop = ins2;
++                            if (offset >= 0x1000000)
++                                assert(0);
++                            const uint hi = cast(uint)(offset >> 12);
++                            const uint lo = cast(uint)(offset & 0xFFF);
++                            const bool mis = (offset & ((1 << shift) - 1)) != 0;
+                             c.IFL1 = FL.unde;
+                             c.IEV1.Vpointer = 0;
+-
+-                            // ldr Rt,[R16,#imm12 & 0xFFF] // https://www.scs.stanford.edu/~zyedidia/arm64/ldr_imm_gen.html
+                             ins = setField(ins,9,5,R16);
+-                            ins = setField(ins,21,10,imm12 & 0xFFF);
+-
+                             code* c2 = code_calloc();
++                            if (!mis)
++                            {
++                                // add R16,Rn,#hi,lsl #12
++                                // ldr Rt,[R16,#lo>>shift]
++                                c.Iop = INSTR.add_addsub_imm(1,1,hi,Rn2,R16);
++                                ins = setField(ins,21,10,lo >> shift);
++                                c2.Iop = ins;
++                                c2.next = c.next;
++                                c.next = c2;
++                                continue;
++                            }
++                            // add R16,Rn,#hi,lsl #12 (if any)
++                            // add R16,R16,#lo
++                            // ldr Rt,[R16]
++                            if (hi == 0)
++                                c.Iop = INSTR.add_addsub_imm(1,0,lo,Rn2,R16);
++                            else
++                                c.Iop = INSTR.add_addsub_imm(1,1,hi,Rn2,R16);
++                            ins = setField(ins,21,10,0);
+                             c2.Iop = ins;
+-                            c2.next = c.next;
+-                            c.next = c2;
++                            if (hi != 0 && lo != 0)
++                            {
++                                code* cadd = code_calloc();
++                                cadd.Iop = INSTR.add_addsub_imm(1,0,lo,R16,R16);
++                                cadd.next = c2;
++                                c2.next = c.next;
++                                c.next = cadd;
++                            }
++                            else
++                            {
++                                c2.next = c.next;
++                                c.next = c2;
++                            }
+                             continue;
+                         }
+                     }
+@@ -2298,6 +2402,14 @@
              op |= ((ad >> 2) & 0x7FFFF) << 5; // imm19 in opcode
              ggen.gen32(op);
          }
@@ -986,7 +1211,7 @@ diff -ruN dmd-2.113.1/compiler/src/dmd/backend/arm/cod3.d dmd-2.113.1/compiler/s
          else if (Symbol* s = c.IEV1.Vsym)
          {
              switch (s.Sclass)
-@@ -2313,7 +2365,9 @@
+@@ -2313,7 +2425,9 @@
                  case SC.inline:
                      ggen.flush();
                      ggen.gen32(op);
@@ -1736,8 +1961,8 @@ diff -ruN dmd-2.113.1/compiler/src/dmd/backend/x86/cgcod.d dmd-2.113.1/compiler/
                  else if ((pretregs & (mSTACK | mES | ALLREGS | mBP | XMMREGS)) == 0)
                  {
 diff -ruN dmd-2.113.1/compiler/src/dmd/backend/x86/cod3.d dmd-2.113.1/compiler/src/dmd/backend/x86/cod3.d
---- dmd-2.113.1/compiler/src/dmd/backend/x86/cod3.d	2026-10-31 15:30:53.000000000 +0100
-+++ dmd-2.113.1/compiler/src/dmd/backend/x86/cod3.d	2026-11-02 08:52:01.565345973 +0100
+--- dmd-2.113.1/compiler/src/dmd/backend/x86/cod3.d
++++ dmd-2.113.1/compiler/src/dmd/backend/x86/cod3.d
 @@ -598,6 +598,23 @@
  }
  
@@ -1900,7 +2125,26 @@ diff -ruN dmd-2.113.1/compiler/src/dmd/backend/x86/cod3.d dmd-2.113.1/compiler/s
          return;
      }
  
-@@ -4823,6 +4901,63 @@
+@@ -4668,9 +4746,18 @@
+                     if (AArch64)
+                     {
+                         // STR preg,[sp,#offset]
++                        // x86 adds EBPtoESP because `and rsp, -align` makes
++                        // SP differ from BP. AArch64 does not AND SP, so
++                        // SP == X29 and EBPtoESP is only localsize.
++                        // assignaddrc addresses this slot at localsize+16,
++                        // past the saved x29/x30 pair. Without the +16 the
++                        // store lands 16 bytes below every later reload, so
++                        // `return e` hands back uninitialized stack.
+ //printf("prolog_loadparams sz=%d preg:%d\n", sz, preg);
+ //printf("offset(%d) = Fast.size(%d) + BPoff(%d) + EBPtoESP(%d)\n",cast(int)offset,cast(int)cgstate.Fast.size,cast(int)cgstate.BPoff,cast(int)cgstate.EBPtoESP);
+                         uint imm = cast(uint)offset;
++                        if (cgstate.hasframe)
++                            imm += 16;
+                         if (mask(preg) & INSTR.FLOATREGS)
+                         {
+                             uint size, opc;
+@@ -4823,6 +4910,63 @@
          }
          // MOV reg,param[BP]
          //assert(refparam);
@@ -1964,6 +2208,23 @@ diff -ruN dmd-2.113.1/compiler/src/dmd/backend/x86/cod3.d dmd-2.113.1/compiler/s
          if (mask(s.Sreglsw) & XMMREGS)
          {
              const op = xmmload(s.Stype.Tty);  // MOVSS/D xreg,mem
+@@ -5639,7 +5783,15 @@
+             case SC.regpar:
+             case SC.shadowreg:
+ //printf("s = '%s', Soffset = x%x, Para.size = x%x, EBPtoESP = x%x\n", s.Sident, s.Soffset, cgstate.Para.size, cgstate.EBPtoESP);
+-                s.Soffset += cgstate.Para.size;
++                // Nested functions add this Soffset to the pointer passed
++                // for the enclosing frame. On x86 that pointer is EBP and
++                // Para.size (saved EBP + return address) reaches the first
++                // stack argument. On AArch64 the pointer is the virtual
++                // frame pointer, x29+16+localsize, which is already the
++                // incoming SP and the first stack argument. Adding Para.size
++                // addresses 16 bytes into the caller's frame.
++                if (!cgstate.AArch64)
++                    s.Soffset += cgstate.Para.size;
+                 if (0 && !(funcsym_p.Sfunc.Fflags3 & Fmember))
+                 {
+                     if (!cgstate.hasframe)
 diff -ruN dmd-2.113.1/compiler/src/dmd/backend/x86/code_x86.d dmd-2.113.1/compiler/src/dmd/backend/x86/code_x86.d
 --- dmd-2.113.1/compiler/src/dmd/backend/x86/code_x86.d	2026-10-31 15:30:53.000000000 +0100
 +++ dmd-2.113.1/compiler/src/dmd/backend/x86/code_x86.d	2026-11-02 05:47:04.392889026 +0100
