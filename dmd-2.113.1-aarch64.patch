@@ -1259,6 +1259,53 @@ diff -ruN dmd-2.113.1/compiler/src/dmd/backend/arm/instr.d dmd-2.113.1/compiler/
   */
  bool encodeNImmrImms(ulong value, out uint N, out uint immr, out uint imms)
  {
+diff -ruN dmd-2.113.1/compiler/src/dmd/backend/cgelem.d dmd-2.113.1/compiler/src/dmd/backend/cgelem.d
+--- dmd-2.113.1/compiler/src/dmd/backend/cgelem.d	2026-10-31 15:30:53.000000000 +0100
++++ dmd-2.113.1/compiler/src/dmd/backend/cgelem.d	2026-11-02 17:23:55.872944502 +0100
+@@ -3655,6 +3655,19 @@
+                 goto L1;
+             goto Ldefault;
+ 
++        case 32:
++            // Two 16-byte reals are a creal, returned in v0 and v1.
++            // Leaving the copy as OPstreq makes cdstreq load the call
++            // as a pointer, and fixresult then looks for a GPR.
++            if (cgstate.AArch64 && targ1 && targ2 &&
++                tybasic(targ1.Tty) == TYreal &&
++                tybasic(targ2.Tty) == TYreal)
++            {
++                tym = TYcreal;
++                goto L1;
++            }
++            goto Ldefault;
++
+         L1:
+             if (ty == TYstruct || ty == TYarray)
+             {
+@@ -3679,9 +3692,21 @@
+                 }
+                 else if (I64 && targ1 && targ2)
+                 {
+-                    if (tyfloating(tybasic(targ1.Tty)) &&
+-                        !cgstate.AArch64) // TODO AArch64
++                    const ty1b = tybasic(targ1.Tty);
++                    const ty2b = tybasic(targ2.Tty);
++                    // A 16-byte HFA of two doubles is returned in v0 and v1.
++                    // TYucent asks for x0/x1, and the real->double result in
++                    // v0 then fails fixresult (outretregs has no FLOATREGS).
++                    if (tyfloating(ty1b) &&
++                        (!cgstate.AArch64 ||
++                         (sz == 16 && ty1b == TYdouble && ty2b == TYdouble)))
+                         tym = TYcdouble;
++                    else if (cgstate.AArch64 && sz == 8 &&
++                             ty1b == TYfloat && ty2b == TYfloat)
++                        tym = TYcfloat;
++                    else if (cgstate.AArch64 && sz == 32 &&
++                             ty1b == TYreal && ty2b == TYreal)
++                        tym = TYcreal;
+                     else if (0 && cgstate.AArch64)
+                         goto Ldefault;
+                     else
 diff -ruN dmd-2.113.1/compiler/src/dmd/backend/cgen.d dmd-2.113.1/compiler/src/dmd/backend/cgen.d
 --- dmd-2.113.1/compiler/src/dmd/backend/cgen.d	2026-10-31 15:30:53.000000000 +0100
 +++ dmd-2.113.1/compiler/src/dmd/backend/cgen.d	2026-11-02 08:18:32.984992867 +0100
