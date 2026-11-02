@@ -18,7 +18,7 @@ diff -ruN dmd-2.113.1/compiler/src/dmd/argtypes_aarch64.d dmd-2.113.1/compiler/s
      }
 diff -ruN dmd-2.113.1/compiler/src/dmd/backend/arm/cod1.d dmd-2.113.1/compiler/src/dmd/backend/arm/cod1.d
 --- dmd-2.113.1/compiler/src/dmd/backend/arm/cod1.d	2026-10-31 15:30:53.000000000 +0100
-+++ dmd-2.113.1/compiler/src/dmd/backend/arm/cod1.d	2026-11-02 07:11:32.557846845 +0100
++++ dmd-2.113.1/compiler/src/dmd/backend/arm/cod1.d	2026-11-02 09:51:40.879761642 +0100
 @@ -35,7 +35,7 @@
  import dmd.backend.rtlsym;
  import dmd.backend.ty;
@@ -50,7 +50,35 @@ diff -ruN dmd-2.113.1/compiler/src/dmd/backend/arm/cod1.d dmd-2.113.1/compiler/s
      assert(test(Extend.UXTH, 0, 0, 8, 2) == 0x92003C00); // AND x0,x0,#0xFFFF
      assert(test(Extend.UXTW, 0, 0, 4, 2) == 0x2A0003E0); // MOV w0,w0
  }
-@@ -1187,10 +1189,35 @@
+@@ -213,7 +215,10 @@
+                 else
+                 {
+                     uint ftype = INSTR.szToFtype(sz);
+-                    cs.Iop = INSTR.fmov(ftype,cs.reg,reg);  // FMOV reg,cs.reg
++                    // fmov(ftype, Vn, Vd) is FMOV Vd,Vn. The value is in
++                    // reg; cs.reg is the variable. The other order copies
++                    // the old variable over the value and leaves it unchanged.
++                    cs.Iop = INSTR.fmov(ftype,reg,cs.reg);  // FMOV cs.reg,reg
+                 }
+             }
+             cs.IFL1 = FL.unde;
+@@ -575,7 +580,14 @@
+     }
+ 
+     getlvalue(cdb, cs, e, keepmsk, rmx);
+-    cs.IEV1.Voffset += offset;
++    // getlvalue() binds a register variable to Sreglsw. x86 calls
++    // getlvalue_msw() when offset == REGSIZE. The memory address moves
++    // by that amount; a register EA ignores it and would copy Sreglsw,
++    // so a returned slice's pointer becomes its length.
++    if (offset == REGSIZE && cs.reg != NOREG && e.Eoper == OPvar)
++        cs.reg = e.Vsym.Sregmsw;
++    else
++        cs.IEV1.Voffset += offset;
+ 
+     //printf("loadea() sz: %d Voffset: %d loadea.offset: %d\n", sz, cast(int)cs.IEV1.Voffset, cast(int)offset);
+     assert(op != LEA);                  // AArch64 does not have LEA
+@@ -1187,10 +1199,35 @@
                   * the opcode. The only way to deal with this is to prevent enregistering
                   * such variables.
                   */
@@ -87,7 +115,17 @@ diff -ruN dmd-2.113.1/compiler/src/dmd/backend/arm/cod1.d dmd-2.113.1/compiler/s
                  if (
                      s.Sclass == SC.regpar ||
                      s.Sclass == SC.parameter)
-@@ -1209,10 +1236,31 @@
+@@ -1204,15 +1241,40 @@
+                 uint off = REGSIZE;
+                 if (tycomplex(ty))
+                     off = tysize(ty) / 2;
+-                if (e.Voffset == off && sz == off)
++                // High half: an elem of that size, or the whole pair with
++                // Voffset already there. A 16-byte real is one register,
++                // so the second form has to be a pair.
++                if (e.Voffset == off &&
++                    (sz == off || (sz == off * 2 && isRegisterPair(true, ty, 0))))
+                     pcs.reg = s.Sregmsw;
  
                  break;
              }
@@ -123,7 +161,7 @@ diff -ruN dmd-2.113.1/compiler/src/dmd/backend/arm/cod1.d dmd-2.113.1/compiler/s
              }
              pcs.IEV1.Vsym = s;
              pcs.IEV1.Voffset = e.Voffset;
-@@ -1415,10 +1463,20 @@
+@@ -1415,10 +1477,20 @@
              // should fix genmovreg() to do this work
              if (tyfloating(tym))
              {
@@ -147,7 +185,7 @@ diff -ruN dmd-2.113.1/compiler/src/dmd/backend/arm/cod1.d dmd-2.113.1/compiler/s
              }
              else
              {
-@@ -1433,13 +1491,22 @@
+@@ -1433,13 +1505,22 @@
              reg_t Vn = findreg(retregs);
              reg_t Vd = allocreg(cdb, outretregs, tym);  // allocate return regs
              //printf("Vn: %d Vd: %d\n", Vn, Vd);
@@ -171,7 +209,7 @@ diff -ruN dmd-2.113.1/compiler/src/dmd/backend/arm/cod1.d dmd-2.113.1/compiler/s
                  cdb.gen1(INSTR.fmov(ftype,Vn,Vd));  // FMOV Vd,Vn
              }
          }
-@@ -1468,6 +1535,7 @@
+@@ -1468,6 +1549,7 @@
  {
      realToDouble,
      doubleToReal,
@@ -179,7 +217,7 @@ diff -ruN dmd-2.113.1/compiler/src/dmd/backend/arm/cod1.d dmd-2.113.1/compiler/s
      add,
      min,
      mul,
-@@ -1554,6 +1622,15 @@
+@@ -1554,6 +1636,15 @@
              break;
          }
  
@@ -195,12 +233,13 @@ diff -ruN dmd-2.113.1/compiler/src/dmd/backend/arm/cod1.d dmd-2.113.1/compiler/s
          case CLIB_A.add:
          {
              string name = "__addtf3";
-@@ -1645,8 +1722,65 @@
+@@ -1645,8 +1736,65 @@
   *      keepmask = mask of registers not to destroy. Saves/restores them
   */
  
 +/* MOV Vd.16B, Vn.16B. Scalar FMOV cannot copy a 128-bit real. */
-+@trusted
+ @trusted
+-void callclib(ref CodeBuilder cdb, elem* e, uint clib, ref regm_t pretregs, regm_t keepmask)
 +private void moveQuad(ref CodeBuilder cdb, reg_t to, reg_t from)
 +{
 +    if (to != from)
@@ -255,14 +294,13 @@ diff -ruN dmd-2.113.1/compiler/src/dmd/backend/arm/cod1.d dmd-2.113.1/compiler/s
 +        moveQuad(cdb, v1, src1);
 +}
 +
- @trusted
--void callclib(ref CodeBuilder cdb, elem* e, uint clib, ref regm_t pretregs, regm_t keepmask)
++@trusted
 +void callclib(ref CodeBuilder cdb, elem* e, uint clib, ref regm_t pretregs, regm_t keepmask,
 +              reg_t src0 = NOREG, reg_t src1 = NOREG)
  {
      //printf("callclib(e = %p, clib = %d, pretregs = %s, keepmask = %s\n", e, clib, regm_str(pretregs), regm_str(keepmask));
      //elem_print(e);
-@@ -1673,7 +1807,15 @@
+@@ -1673,7 +1821,15 @@
          }
      }
  
@@ -278,7 +316,7 @@ diff -ruN dmd-2.113.1/compiler/src/dmd/backend/arm/cod1.d dmd-2.113.1/compiler/s
      if (nalign)
          cod3_stackadj(cdb, -nalign);
      cgstate.calledafunc = 1;
-@@ -1827,6 +1969,14 @@
+@@ -1827,6 +1983,14 @@
          if (alignsize > STACKALIGN)
              alignsize = STACKALIGN;         // no point if the stack is less aligned
  
@@ -293,7 +331,7 @@ diff -ruN dmd-2.113.1/compiler/src/dmd/backend/arm/cod1.d dmd-2.113.1/compiler/s
          /* Alignment on OSX64 AArch64 is the same as for struct fields.
           * If it is a variadic function, the last parameter (lastPar) is aligned on 8 bytes.
           * Match behavior in backend.arm.cod1.cdfunc()
-@@ -1838,7 +1988,10 @@
+@@ -1838,7 +2002,10 @@
  
          p.offset = numpara;
          //printf("[%d] param offset =  x%x, alignsize = %d\n", i, cast(int) numpara, cast(int) alignsize);
@@ -305,7 +343,7 @@ diff -ruN dmd-2.113.1/compiler/src/dmd/backend/arm/cod1.d dmd-2.113.1/compiler/s
      }
  
      //printf("numpara: %d STACKALIGN: %d\n", numpara, STACKALIGN);
-@@ -2168,12 +2321,18 @@
+@@ -2168,12 +2335,18 @@
          {
              s = getRtlsym(RTLSYM.ALLOCA);
              makeitextern(s);
@@ -330,7 +368,35 @@ diff -ruN dmd-2.113.1/compiler/src/dmd/backend/arm/cod1.d dmd-2.113.1/compiler/s
          }
          if (sytab[s.Sclass] & SCSS)    // if function is on stack (!)
          {
-@@ -2613,6 +2772,16 @@
+@@ -2443,6 +2616,9 @@
+     scodelem(cgstate,cdb, e, retregs, 0, true);
+     if (isPair)
+     {
++        // The caller's sz is the alignment, not the byte size. A 16-byte
++        // slice arrives as sz==8, and storing sz+szx bytes then sz bytes
++        // writes a 32-bit STR and a 64-bit STR to the same slot.
+         uint szx = cast(uint)tysize(tym) / 2;
+         const reg_t rmsw = findreg(retregs & INSTR.MSW);
+         code cs;
+@@ -2450,14 +2626,14 @@
+         cs.base = INSTR.SP;
+         cs.index = NOREG;
+         cs.IFL1 = FL.offset;
+-        storeToEA(cs, rmsw, cast(uint)sz + szx);
+-        cs.IEV1.Voffset = funcargtos;
++        storeToEA(cs, rmsw, szx);
++        cs.IEV1.Voffset = funcargtos + szx;
+         cdb.gen(&cs);
+ 
+         const reg_t rlsw = findreg(retregs & INSTR.LSW);
+         cs.IFL1 = FL.offset;
+         cs.IEV1.Voffset = 0;
+-        storeToEA(cs, rlsw, cast(uint)sz);
++        storeToEA(cs, rlsw, szx);
+         cs.IEV1.Voffset = funcargtos;
+         cdb.gen(&cs);
+     }
+@@ -2613,6 +2789,16 @@
      }
      else
      {
@@ -349,7 +415,7 @@ diff -ruN dmd-2.113.1/compiler/src/dmd/backend/arm/cod1.d dmd-2.113.1/compiler/s
          if (cgstate.regcon.params &&
 diff -ruN dmd-2.113.1/compiler/src/dmd/backend/arm/cod2.d dmd-2.113.1/compiler/src/dmd/backend/arm/cod2.d
 --- dmd-2.113.1/compiler/src/dmd/backend/arm/cod2.d	2026-10-31 15:30:53.000000000 +0100
-+++ dmd-2.113.1/compiler/src/dmd/backend/arm/cod2.d	2026-11-02 06:44:41.298621546 +0100
++++ dmd-2.113.1/compiler/src/dmd/backend/arm/cod2.d	2026-11-02 10:13:00.129128623 +0100
 @@ -163,7 +163,8 @@
                  default:
                      assert(0);
@@ -420,7 +486,37 @@ diff -ruN dmd-2.113.1/compiler/src/dmd/backend/arm/cod2.d dmd-2.113.1/compiler/s
              assert(0);
      }
  
-@@ -1812,10 +1841,12 @@
+@@ -1371,6 +1400,9 @@
+     //printf("s1: %d s2: n: %d Rr: %d Ri: %d Rv1: %d Rv2: %d\n", s1,s2,Rn,Rr,Ri,Rv1,Rv2);
+ 
+     movregconst(cdb,Rr,0,pretregs & mPSW);      // MOV Rr,0 setting flags in case Rn is zero
++    // SUBS writes Rr when the bytes differ. A stale tracked 0 makes the
++    // next movregconst(#0) copy this register instead of loading 0.
++    cgstate.regcon.immed.mval &= ~mask(Rr);
+ 
+     code* cnop1 = gen1(null, INSTR.nop);        // branch target L1
+     code* cnop2 = gen1(null, INSTR.nop);        // branch target L2
+@@ -1380,6 +1412,7 @@
+     genCompBranch(cdb,1,Rn,false,FL.code,cast(block*) cnop2);   // CBZ Rn,L2
+ 
+     movregconst(cdb,Ri,0,0);                    // MOV Ri,0
++    cgstate.regcon.immed.mval &= ~mask(Ri);     // ADD Ri,Ri,#1 below
+ 
+     cdb.append(cnop1);                          // L1:
+ 
+@@ -1762,7 +1795,10 @@
+     else
+     {
+         assert(szv == 4 || szv == 8);
+-        cdb.gen1(INSTR.str_imm_gen_post_index(is64,szv,Rp,Rv));   // L2: STR  Rv,[Rp],#szv    // *Rp++ = Rv
++        // is64 means "value is a 16-byte pair", not "64-bit store".
++        // An 8-byte element sits in one X register. STR W with a
++        // post-index of 8 leaves the high half of every slot stale.
++        cdb.gen1(INSTR.str_imm_gen_post_index(szv == 8,szv,Rp,Rv));   // L2: STR  Rv,[Rp],#szv    // *Rp++ = Rv
+     }
+     code* L2 = cdb.last();
+     if (szv == REGSIZE * 2)
+@@ -1812,10 +1848,12 @@
          codelem(cgstate,cdb,e2,srcregs,false);
      }
  
@@ -436,7 +532,7 @@ diff -ruN dmd-2.113.1/compiler/src/dmd/backend/arm/cod2.d dmd-2.113.1/compiler/s
      if (e1.Eoper == OPind)               // if (*p = ..)
      {
          scodelem(cg,cdb,e1.E1,dstregs,srcregs,false);
-@@ -1861,7 +1892,7 @@
+@@ -1861,7 +1899,7 @@
              loadFromEA(csrc,Rv,4,4);
              cdb.genc1(csrc.Iop,0,FL.offset,offset);
              storeToEA(cdst,Rv,4);
@@ -445,7 +541,7 @@ diff -ruN dmd-2.113.1/compiler/src/dmd/backend/arm/cod2.d dmd-2.113.1/compiler/s
              offset += 4;
              numbytes -= 4;
          }
-@@ -1871,7 +1902,7 @@
+@@ -1871,7 +1909,7 @@
              loadFromEA(csrc,Rv,4,2);
              cdb.genc1(csrc.Iop,0,FL.offset,offset);
              storeToEA(cdst,Rv,2);
@@ -454,7 +550,7 @@ diff -ruN dmd-2.113.1/compiler/src/dmd/backend/arm/cod2.d dmd-2.113.1/compiler/s
              offset += 2;
              numbytes -= 2;
          }
-@@ -1881,7 +1912,7 @@
+@@ -1881,7 +1919,7 @@
              loadFromEA(csrc,Rv,4,1);
              cdb.genc1(csrc.Iop,0,FL.offset,offset);
              storeToEA(cdst,Rv,1);
@@ -463,13 +559,25 @@ diff -ruN dmd-2.113.1/compiler/src/dmd/backend/arm/cod2.d dmd-2.113.1/compiler/s
          }
      }
      else
-@@ -2051,6 +2082,23 @@
+@@ -1919,6 +1957,10 @@
+ 
+         movregconst(cdb,Rc,numbytes * 8,0);             // mov   Rc,#count * 8
+         movregconst(cdb,Ri,0,0);                        // mov   Ri,0
++        // ADD Ri,Ri,#8 runs until Ri == Rc. Leave the tracked 0 in place and
++        // the next struct copy's movregconst(#0) emits MOV new,Ri, so the
++        // loop starts at the byte count and walks off the end.
++        cgstate.regcon.immed.mval &= ~mask(Ri);
+ 
+         loadFromEA(csrc,Rv,8,8);                        // L2:   ldr Rv,[Rs,Ri]
+         cdb.genc1(csrc.Iop,0,FL.unde,0);
+@@ -2051,6 +2093,26 @@
   * reg.
   */
  
 +/* Add a byte offset to an address already in reg.
 + * Used after a GOT or TLS sequence, whose relocations address the symbol itself.
 + */
++@trusted
 +private void addRegOffset(ref CodeBuilder cdb, reg_t reg, targ_size_t off)
 +{
 +    if (!off)
@@ -477,17 +585,19 @@ diff -ruN dmd-2.113.1/compiler/src/dmd/backend/arm/cod2.d dmd-2.113.1/compiler/s
 +    if (off < 0x1000)
 +    {
 +        cdb.gen1(INSTR.add_addsub_imm(1, 0, cast(uint)off, reg, reg));
++        cgstate.regcon.immed.mval &= ~mask(reg);
 +        return;
 +    }
 +    const reg_t tmp = reg == 17 ? 16 : 17;
 +    movregconst(cdb, tmp, off, 64);
 +    cdb.gen1(INSTR.addsub_shift(1, 0, 0, 0, cast(ubyte)tmp, 0, cast(ubyte)reg, cast(ubyte)reg));
++    cgstate.regcon.immed.mval &= ~mask(reg);
 +}
 +
  @trusted
  void getoffset(ref CGstate cg, ref CodeBuilder cdb,elem* e,reg_t reg)
  {
-@@ -2084,6 +2132,20 @@
+@@ -2084,6 +2146,20 @@
              if (config.exe & EX_posix)
              {
                  if (log) printf("posix threaded\n");
@@ -508,7 +618,7 @@ diff -ruN dmd-2.113.1/compiler/src/dmd/backend/arm/cod2.d dmd-2.113.1/compiler/s
                  uint ins = INSTR.systemmove(1,INSTR.tpidr_el0,reg); // MRS reg,tpidr_el0
                  cdb.gen1(ins);
  
-@@ -2093,6 +2155,7 @@
+@@ -2093,6 +2169,7 @@
                  ins = INSTR.addsub_imm(1,0,0,0,0,reg,reg);          // ADD reg,reg,#0
                  cdb.gencs1(ins,0,fl,e.Vsym);
                  cdb.last.Iflags |= CFadd;
@@ -516,7 +626,7 @@ diff -ruN dmd-2.113.1/compiler/src/dmd/backend/arm/cod2.d dmd-2.113.1/compiler/s
                  return;
              }
              assert(0);
-@@ -2228,7 +2291,9 @@
+@@ -2228,7 +2305,9 @@
              goto L4;
  
          case FL.extern_:
@@ -527,7 +637,7 @@ diff -ruN dmd-2.113.1/compiler/src/dmd/backend/arm/cod2.d dmd-2.113.1/compiler/s
              {
                  if (log) printf("posix extern threaded\n");
                  regm_t scratch = INSTR.ALLREGS & ~mask(reg);
-@@ -2236,14 +2301,15 @@
+@@ -2236,14 +2315,15 @@
                  uint ins = INSTR.systemmove(1,INSTR.tpidr_el0,r);  // MRS r,tpidr_el0
                  cdb.gen1(ins);
  
@@ -546,7 +656,7 @@ diff -ruN dmd-2.113.1/compiler/src/dmd/backend/arm/cod2.d dmd-2.113.1/compiler/s
                  return;
              }
  //            if (config.exe & EX_WIN64 && e.Vsym.ty() & mTYthread)
-@@ -2274,16 +2340,41 @@
+@@ -2274,16 +2354,41 @@
              }
              else
              {
@@ -598,7 +708,7 @@ diff -ruN dmd-2.113.1/compiler/src/dmd/backend/arm/cod2.d dmd-2.113.1/compiler/s
              }
              break;
  
-@@ -2595,8 +2686,9 @@
+@@ -2595,8 +2700,9 @@
      {
          gentstreg(cdb,cs.reg,sz == 8);          // CMP cs.reg,#0
  
@@ -610,7 +720,7 @@ diff -ruN dmd-2.113.1/compiler/src/dmd/backend/arm/cod2.d dmd-2.113.1/compiler/s
  
          const n = e2.Vint;
          uint opx = e.Eoper == OPpostinc ? 0 : 1;
-@@ -2624,8 +2716,12 @@
+@@ -2624,8 +2730,12 @@
              pretregs &= ~mPSW;
          }
  
@@ -627,7 +737,7 @@ diff -ruN dmd-2.113.1/compiler/src/dmd/backend/arm/cod2.d dmd-2.113.1/compiler/s
          uint opx = e.Eoper == OPpostinc ? 0 : 1;
 diff -ruN dmd-2.113.1/compiler/src/dmd/backend/arm/cod3.d dmd-2.113.1/compiler/src/dmd/backend/arm/cod3.d
 --- dmd-2.113.1/compiler/src/dmd/backend/arm/cod3.d	2026-10-31 15:30:53.000000000 +0100
-+++ dmd-2.113.1/compiler/src/dmd/backend/arm/cod3.d	2026-11-02 06:44:41.298621546 +0100
++++ dmd-2.113.1/compiler/src/dmd/backend/arm/cod3.d	2026-11-02 09:51:40.653902843 +0100
 @@ -30,7 +30,10 @@
  import dmd.backend.cdef;
  import dmd.backend.cgcse;
@@ -640,7 +750,65 @@ diff -ruN dmd-2.113.1/compiler/src/dmd/backend/arm/cod3.d dmd-2.113.1/compiler/s
  import dmd.backend.arm.disasmarm : encodeHFD;
  import dmd.backend.x86.cgcod : disassemble;
  import dmd.backend.x86.code_x86;
-@@ -1030,8 +1033,12 @@
+@@ -242,6 +245,9 @@
+ bool isBranch(uint ins) { return ((ins & 0xFF00_0000) == 0x5400_0000) ||
+                                  ((ins & 0x7E00_0000) == 0x3400_0000); }
+ 
++// B and BL. imm26 is bits 25:0, so these must not go through isBranch (imm19).
++bool isUncondBranch(uint ins) { return (ins & 0x7C00_0000) == 0x1400_0000; }
++
+ enum MARS = true;
+ 
+ // outswitab
+@@ -371,7 +377,17 @@
+     cs.Sextend = 0;
+     cs.IEV1.Vsym = null;
+     cs.IEV1.Voffset = slot;
+-    storeToEA(cs, reg, tysize(tym));
++    uint sz = tysize(tym);
++    if (!(mask(reg) & INSTR.FLOATREGS) && sz > 8)
++    {
++        // cse_save() passes the whole elem type for each register.
++        // A slice, delegate, or cent is 16 bytes, 8 in each GPR, and
++        // gen_loadcse() reads at most 8 bytes back. storeToEA() emits
++        // STR X only for sz==8; 16 becomes STR W, so the reload's
++        // high half is leftover stack.
++        sz = 8;
++    }
++    storeToEA(cs, reg, sz);
+     assert(cs.Iop);
+     cdb.gen(&cs);
+ }
+@@ -533,13 +549,16 @@
+             : INSTR.str_imm_gen(1, reg, fp, gpoffset);            // STR reg,[fp,#offset]
+         cdb.gen1(ins);
+ 
+-        if (0) // TODO AArch64
+         if (config.fulltypes == CVDWARF_C || config.fulltypes == CVDWARF_D ||
+             config.ehmethod == EHmethod.EH_DWARF)
+-        {   // Emit debug_frame data giving location of saved register
++        {   // Saved register, as an instruction count. The CIE scales
++            // DW_CFA_advance_loc by the code alignment factor, which is 4.
+             code* c = cdb.finish();
+             pinholeopt(c, null);
+-            dwarf_CFA_set_loc(calcblksize(c));  // address after save
++            uint bytes = 0;
++            for (code* p = c; p; p = code_next(p))
++                bytes += calccodsize(p);
++            dwarf_CFA_set_loc(bytes / 4);
+             dwarf_CFA_offset(reg, cast(int)(gpoffset - cfa_offset));
+             cdb.reset();
+             cdb.append(c);
+@@ -1016,7 +1035,7 @@
+                 genregs(cdbx,0x39,SP,BP);                             // CMP EBP,ESP
+                 if (I64)
+                     code_orrex(cdbx.last(),REX_W);
+-                genjmp(cdbx,JNE,FL.code,cast(block*)c1);                  // JNE L1
++                genBranch(cdbx,COND.ne,FL.code,cast(block*)c1);            // B.ne L1
+                 // explicitly mark as short jump, needed for correct retsize calculation (Bugzilla 15779)
+                 cdbx.last().Iflags &= ~CFjmp16;
+                 cdbx.gen1(0x58 + BP);                                 // POP BP
+@@ -1030,8 +1049,12 @@
              else
              {
                  if (log) printf("epilog: mov sp,bp\n");
@@ -655,7 +823,7 @@ diff -ruN dmd-2.113.1/compiler/src/dmd/backend/arm/cod3.d dmd-2.113.1/compiler/s
                  else
                  {
                      /* LDP x29,x30,[sp] https://www.scs.stanford.edu/~zyedidia/arm64/ldp_gen.html
-@@ -1224,8 +1231,12 @@
+@@ -1224,8 +1247,12 @@
              cdb.append(c1);
          }
      }
@@ -670,7 +838,7 @@ diff -ruN dmd-2.113.1/compiler/src/dmd/backend/arm/cod3.d dmd-2.113.1/compiler/s
  
      thunkoffset = Offset(seg);
      code* c = cdb.finish();
-@@ -1449,22 +1460,32 @@
+@@ -1449,22 +1476,32 @@
          }
          else // one or both are floating point registers
          {
@@ -715,29 +883,18 @@ diff -ruN dmd-2.113.1/compiler/src/dmd/backend/arm/cod3.d dmd-2.113.1/compiler/s
          }
      }
  }
-@@ -1747,17 +1768,34 @@
+@@ -1747,14 +1784,20 @@
                      //printf("fix ESP\n");
                      if (cgstate.hasframe)
                      {
 -                        c.Iop = INSTR.sub_addsub_imm(1,0,cgstate.EBPtoESP,INSTR.SP,BP); // SUB SP,BP,#EBPtoESP
-+                        // x86 is LEA ESP,-EBPtoESP[EBP]. SP = X29 - delta.
-+                        // addsub_imm's imm12 is only 12 bits; a larger frame
-+                        // (or a catch block in one) needs the lsl#12 form too.
++                        // The prologue leaves SP == X29: the saved pair is at
++                        // [X29] and locals live above it. The epilogue is
++                        // `ldp x29,x30,[sp],#framesize` and needs that SP.
++                        // x86's LEA ESP,-EBPtoESP[EBP] drops SP into the frame,
++                        // so the epilogue loads a garbage link register.
 +                        // INSTR.BP is X29. Bare BP is the x86 register number.
-+                        const uint delta = cast(uint)cgstate.EBPtoESP;
-+                        const uint lo = delta & 0xFFF;
-+                        const uint hi = delta >> 12;
-+                        assert(hi < 0x1000);
-+                        c.Iop = INSTR.sub_addsub_imm(1, 0, lo, INSTR.BP, INSTR.SP);
-+                        code* tail = c;
-+                        if (hi)
-+                        {
-+                            code* cn = code_calloc();
-+                            cn.Iop = INSTR.sub_addsub_imm(1, 1, hi, INSTR.SP, INSTR.SP);
-+                            cn.next = c.next;
-+                            c.next = cn;
-+                            tail = cn;
-+                        }
++                        c.Iop = INSTR.mov_add_addsub_imm(1, INSTR.BP, INSTR.SP); // MOV SP,X29
                          if (cgstate.enforcealign)
                          {
                              code* cn = code_calloc();
@@ -747,14 +904,9 @@ diff -ruN dmd-2.113.1/compiler/src/dmd/backend/arm/cod3.d dmd-2.113.1/compiler/s
 -                            cn.Iop = INSTR.log_imm(1,0,N,immr,imms,SP,SP);      // AND SP,SP,#-STACKALIGN
 +                            cn.Iop = INSTR.log_imm(1,0,N,immr,imms,INSTR.SP,INSTR.SP); // AND SP,SP,#-STACKALIGN
  
--                            cn.next = c.next;
--                            c.next = cn;
-+                            cn.next = tail.next;
-+                            tail.next = cn;
-                         }
-                     }
-                     continue;
-@@ -1907,7 +1945,7 @@
+                             cn.next = c.next;
+                             c.next = cn;
+@@ -1907,7 +1950,7 @@
  
              case FL.allocatmp:
                  offset = c.IEV1.Vpointer + cgstate.Alloca.offset + cgstate.BPoff;
@@ -763,7 +915,22 @@ diff -ruN dmd-2.113.1/compiler/src/dmd/backend/arm/cod3.d dmd-2.113.1/compiler/s
  
              case FL.funcarg:
                  offset = c.IEV1.Vpointer + cgstate.funcarg.offset + cgstate.BPoff;
-@@ -2313,7 +2351,9 @@
+@@ -2298,6 +2341,14 @@
+             op |= ((ad >> 2) & 0x7FFFF) << 5; // imm19 in opcode
+             ggen.gen32(op);
+         }
++        else if (isUncondBranch(op) && c.IFL1 == FL.block)
++        {
++            // B/BL. Offset is from this instruction, in 4-byte units.
++            ggen.flush();
++            int ad = cast(int)(c.IEV1.Vblock.Boffset - ggen.offset);
++            op = (op & ~0x03FF_FFFF) | (cast(uint)(ad >> 2) & 0x03FF_FFFF);
++            ggen.gen32(op);
++        }
+         else if (Symbol* s = c.IEV1.Vsym)
+         {
+             switch (s.Sclass)
+@@ -2313,7 +2364,9 @@
                  case SC.inline:
                      ggen.flush();
                      ggen.gen32(op);
@@ -776,7 +943,16 @@ diff -ruN dmd-2.113.1/compiler/src/dmd/backend/arm/cod3.d dmd-2.113.1/compiler/s
                  default:
 diff -ruN dmd-2.113.1/compiler/src/dmd/backend/arm/cod4.d dmd-2.113.1/compiler/src/dmd/backend/arm/cod4.d
 --- dmd-2.113.1/compiler/src/dmd/backend/arm/cod4.d	2026-10-31 15:30:53.000000000 +0100
-+++ dmd-2.113.1/compiler/src/dmd/backend/arm/cod4.d	2026-11-02 07:09:17.201736436 +0100
++++ dmd-2.113.1/compiler/src/dmd/backend/arm/cod4.d	2026-11-02 10:12:47.000988332 +0100
+@@ -43,7 +43,7 @@
+ import dmd.backend.x86.xmm;
+ import dmd.backend.arm.cod1 : getlvalue, loadFromEA, storeToEA,CLIB_A,callclib;
+ import dmd.backend.arm.cod2 : idxregm, tyToExtend;
+-import dmd.backend.arm.cod3 : COND, conditionCode, gentstreg, loadFloatRegConst;
++import dmd.backend.arm.cod3 : COND, conditionCode, genBranch, gentstreg, loadFloatRegConst;
+ import dmd.backend.arm.instr;
+ 
+ 
 @@ -134,7 +134,9 @@
              // If loading result into a register
              if (cs.reg != NOREG)
@@ -788,7 +964,24 @@ diff -ruN dmd-2.113.1/compiler/src/dmd/backend/arm/cod4.d dmd-2.113.1/compiler/s
                  const p = cast(targ_size_t*) &(e2.EV);
                  movregconst(cdb,cs.reg,*p,sz == 8);
              }
-@@ -240,8 +242,11 @@
+@@ -234,14 +236,25 @@
+         // do the MSW
+         cs.Iop = IopSave;
+         reg_t mswreg = findreg(retregs & INSTR.MSW);
+-        assert(cs.index == NOREG);  // BUG AArch64 cannot add the '8' offset
+-        //assert(cs.base != NOREG);
+-        cs.IEV1.Voffset = sz / 2;
++        assert(cs.index == NOREG);
++        // A register EA ignores Voffset, so the high half would be mov'd
++        // into Sreglsw and replace the low half. Memory keeps the field
++        // offset and then adds the half size.
++        if (cs.reg != NOREG)
++        {
++            assert(e1.Eoper == OPvar);
++            cs.reg = e1.Vsym.Sregmsw;
++        }
++        else
++            cs.IEV1.Voffset += sz / 2;
          storeToEA(cs, mswreg, sz / 2);
          cdb.gen(&cs);
      }
@@ -802,7 +995,15 @@ diff -ruN dmd-2.113.1/compiler/src/dmd/backend/arm/cod4.d dmd-2.113.1/compiler/s
  
      if (e1.Ecount ||                    // if lvalue is a CSE or
          regvar)                         // rvalue can't be a CSE
-@@ -424,7 +429,11 @@
+@@ -269,6 +282,7 @@
+         assert(imm12 < 0x1000);  // should use movregconst() if this assert trips
+         uint ins = INSTR.addsub_imm(sz == 8,0,op,sh,postinc,ireg,ireg); // ADD/SUB ireg,ireg,imm12,shift
+         cdb.gen1(ins);
++        cgstate.regcon.immed.mval &= ~mask(ireg);
+     }
+     freenode(e1);
+ }
+@@ -424,7 +438,11 @@
          uint imm3 = 0;                // shift amount
          uint S = forccs != 0;
          uint opt = 0;
@@ -814,7 +1015,7 @@ diff -ruN dmd-2.113.1/compiler/src/dmd/backend/arm/cod4.d dmd-2.113.1/compiler/s
          reg_t Rm = reg2;
          reg_t Rn = reg1;
          reg_t Rd = reg1;
-@@ -710,7 +719,11 @@
+@@ -710,7 +728,11 @@
          }
          regm_t idxregs = idxregm(cs);  // save index registers so we can do the storeToEA() later
          regm_t dummy;
@@ -827,7 +1028,16 @@ diff -ruN dmd-2.113.1/compiler/src/dmd/backend/arm/cod4.d dmd-2.113.1/compiler/s
      }
      else
      {
-@@ -1565,10 +1578,10 @@
+@@ -1147,7 +1169,7 @@
+                 rreg = findreg(rretregs & INSTR.MSW);
+                 uint ins = INSTR.cmp_subs_addsub_shift(1, rreg, 0, 0, reg); // CMP reg, rreg
+                 cdb.gen1(ins);
+-                genjmp(cdb,JNE,FL.code,cast(block*) ce);      // JNE nop
++                genBranch(cdb, COND.ne, FL.code, cast(block*) ce); // B.ne ce
+ 
+                 reg = findreg(retregs & INSTR.LSW);
+                 rreg = findreg(rretregs & INSTR.LSW);
+@@ -1565,10 +1587,10 @@
      {
          case OPd_s16:                               // fcvtzs w0,d31  // sxth w0,w0
          case OPd_s32: ftype = 1; sf = 0; goto L2;   // fcvtzs w0,d31
@@ -840,7 +1050,7 @@ diff -ruN dmd-2.113.1/compiler/src/dmd/backend/arm/cod4.d dmd-2.113.1/compiler/s
          L2:
              regm_t retregs1 = INSTR.FLOATREGS;
              codelem(cgstate,cdb,e.E1,retregs1,false);
-@@ -1590,8 +1603,9 @@
+@@ -1590,8 +1612,9 @@
                      cdb.gen1(INSTR.fcvtzs(0,1,V1,Rd));                  // fcvtzs Rd,V1
                      break;
                  case OPd_s64:
@@ -852,7 +1062,7 @@ diff -ruN dmd-2.113.1/compiler/src/dmd/backend/arm/cod4.d dmd-2.113.1/compiler/s
                      break;
                  case OPd_u16:
                      cdb.gen1(INSTR.fcvtzu(0,ftype,V1,Rd));              // fcvtzu Rd,V1
-@@ -1603,8 +1617,7 @@
+@@ -1603,8 +1626,7 @@
                      cdb.gen1(INSTR.fcvtzu(0,1,V1,Rd));                  // fcvtzu Rd,V1
                      break;
                  case OPd_u64:
@@ -862,7 +1072,7 @@ diff -ruN dmd-2.113.1/compiler/src/dmd/backend/arm/cod4.d dmd-2.113.1/compiler/s
                      break;
                  default:
                      assert(0);
-@@ -1696,6 +1709,12 @@
+@@ -1696,6 +1718,12 @@
              callclib(cdb,e,clib,pretregs,0);
              break;
  
@@ -875,7 +1085,7 @@ diff -ruN dmd-2.113.1/compiler/src/dmd/backend/arm/cod4.d dmd-2.113.1/compiler/s
          default:
              assert(0);
      }
-@@ -1748,7 +1767,10 @@
+@@ -1748,7 +1776,10 @@
              Extend extend = e1.Eoper == OPu8_16 ? Extend.UXTB : Extend.UXTH;
              cs.Sextend = cast(ubyte)((cs.Sextend & 8) | extend);  // preserve S bit
              reg_t reg = allocreg(cdb,retregs,TYint);
@@ -887,7 +1097,7 @@ diff -ruN dmd-2.113.1/compiler/src/dmd/backend/arm/cod4.d dmd-2.113.1/compiler/s
              cdb.gen(&cs);
              freenode(e1.E1);
              freenode(e1);
-@@ -1784,7 +1806,8 @@
+@@ -1784,7 +1815,8 @@
          Extend extend = e1.Eoper == OPs8_16 ? Extend.SXTB : Extend.SXTH;
          cs.Sextend = cast(ubyte)((cs.Sextend & 8) | extend);  // preserve S bit
          reg_t reg = allocreg(cdb,retregs,TYint);
@@ -897,7 +1107,7 @@ diff -ruN dmd-2.113.1/compiler/src/dmd/backend/arm/cod4.d dmd-2.113.1/compiler/s
          cdb.gen(&cs);
          freenode(e1.E1);
          freenode(e1);
-@@ -1822,7 +1845,9 @@
+@@ -1822,7 +1854,9 @@
                  //    INSTR.log_imm(sf,opc,N,immr,imms,Rn,Rd)
                  uint N,immr,imms;
                  assert(encodeNImmrImms(0xFF,N,immr,imms));
@@ -949,9 +1159,46 @@ diff -ruN dmd-2.113.1/compiler/src/dmd/backend/arm/instr.d dmd-2.113.1/compiler/
      }
  
      /* LDR (register)
+diff -ruN dmd-2.113.1/compiler/src/dmd/backend/cgen.d dmd-2.113.1/compiler/src/dmd/backend/cgen.d
+--- dmd-2.113.1/compiler/src/dmd/backend/cgen.d	2026-10-31 15:30:53.000000000 +0100
++++ dmd-2.113.1/compiler/src/dmd/backend/cgen.d	2026-11-02 08:18:32.984992867 +0100
+@@ -175,8 +175,14 @@
+  * Generate 'nop'
+  */
+ 
++@trusted
+ code* gennop(code* c)
+ {
++    import dmd.backend.arm.instr : INSTR;
++    // x86 NOP is 0x2E. Emitted as an AArch64 word that is udf #0x2e, and
++    // binary-search switches branch to it. INSTR.nop is a zero-size marker.
++    if (cgstate.AArch64)
++        return gen1(c, INSTR.nop);
+     return gen1(c,NOP);
+ }
+ 
+diff -ruN dmd-2.113.1/compiler/src/dmd/backend/codebuilder.d dmd-2.113.1/compiler/src/dmd/backend/codebuilder.d
+--- dmd-2.113.1/compiler/src/dmd/backend/codebuilder.d	2026-10-31 15:30:53.000000000 +0100
++++ dmd-2.113.1/compiler/src/dmd/backend/codebuilder.d	2026-11-02 08:18:32.984992867 +0100
+@@ -377,9 +377,14 @@
+         }
+     }
+ 
++    @trusted
+     void gennop()
+     {
+-        gen1(NOP);
++        import dmd.backend.arm.instr : INSTR;
++        if (cgstate.AArch64)
++            gen1(INSTR.nop);
++        else
++            gen1(NOP);
+     }
+ 
+     /**************************
 diff -ruN dmd-2.113.1/compiler/src/dmd/backend/dwarfdbginf.d dmd-2.113.1/compiler/src/dmd/backend/dwarfdbginf.d
 --- dmd-2.113.1/compiler/src/dmd/backend/dwarfdbginf.d	2026-10-31 15:30:53.000000000 +0100
-+++ dmd-2.113.1/compiler/src/dmd/backend/dwarfdbginf.d	2026-11-02 02:49:40.116243374 +0100
++++ dmd-2.113.1/compiler/src/dmd/backend/dwarfdbginf.d	2026-11-02 08:51:19.606259292 +0100
 @@ -201,7 +201,12 @@
      void dwarf_addrel(int seg, targ_size_t offset, int targseg, targ_size_t val = 0)
      {
@@ -978,6 +1225,37 @@ diff -ruN dmd-2.113.1/compiler/src/dmd/backend/dwarfdbginf.d dmd-2.113.1/compile
          else if (config.objfmt == OBJ_MACH)
              Obj.addrel(seg, offset, null, targseg, RELaddr, cast(uint)val);
          else
+@@ -448,7 +456,15 @@
+         {
+             if (offset <= 0)
+             {
+-                cfa_buf.writeByte(cast(ubyte)(DW_CFA_offset + dw_reg));
++                // DW_CFA_offset encodes the register in 6 bits. SIMD
++                // registers (AArch64 Vn is 64+) need the extended form.
++                if (dw_reg <= 0x3F)
++                    cfa_buf.writeByte(cast(ubyte)(DW_CFA_offset + dw_reg));
++                else
++                {
++                    cfa_buf.writeByte(DW_CFA_offset_extended);
++                    cfa_buf.writeuLEB128(dw_reg);
++                }
+                 cfa_buf.writeuLEB128(offset / -OFFSET_FAC);
+             }
+             else
+@@ -1724,10 +1740,11 @@
+         //printf("dwarf_func_start(%s)\n", sfunc.Sident.ptr);
+         if (config.target_cpu == TARGET_AArch64)
+         {
++            // Match the CIE: CFA = SP+0. x30 is the return column and is
++            // still live, so it is not a memory offset.
+             memset(&CFA_state_current,0,CFA_state.sizeof);
+-            CFA_state_current.offset   = 4;
++            CFA_state_current.offset   = 0;
+             CFA_state_current.reg      = 31;      // SP
+-            CFA_state_current.regstates[32].offset = -8; // PC
+         }
+         else
+         {
 diff -ruN dmd-2.113.1/compiler/src/dmd/backend/elem.d dmd-2.113.1/compiler/src/dmd/backend/elem.d
 --- dmd-2.113.1/compiler/src/dmd/backend/elem.d	2026-10-31 15:30:53.000000000 +0100
 +++ dmd-2.113.1/compiler/src/dmd/backend/elem.d	2026-11-02 06:52:57.889851124 +0100
@@ -1268,8 +1546,19 @@ diff -ruN dmd-2.113.1/compiler/src/dmd/backend/elpicpie.d dmd-2.113.1/compiler/s
                       * This is so we can preserve the magic sequence of instructions
 diff -ruN dmd-2.113.1/compiler/src/dmd/backend/x86/cgcod.d dmd-2.113.1/compiler/src/dmd/backend/x86/cgcod.d
 --- dmd-2.113.1/compiler/src/dmd/backend/x86/cgcod.d	2026-10-31 15:30:53.000000000 +0100
-+++ dmd-2.113.1/compiler/src/dmd/backend/x86/cgcod.d	2026-11-02 06:25:54.678551350 +0100
-@@ -2833,10 +2833,12 @@
++++ dmd-2.113.1/compiler/src/dmd/backend/x86/cgcod.d	2026-11-02 08:51:34.514468773 +0100
+@@ -969,6 +969,10 @@
+     {
+         assert(I32 || I64);
+         prolog_frameadj2(cg, cdbx, tyf, xlocalsize, &pushalloc);
++        if (cg.AArch64 &&
++            (config.fulltypes == CVDWARF_C || config.fulltypes == CVDWARF_D ||
++             config.ehmethod == EHmethod.EH_DWARF))
++            cfa_offset = cast(int)xlocalsize;
+         version (FRAMEPTR) { } else
+             cg.BPoff += REGSIZE;
+     }
+@@ -2833,10 +2837,12 @@
                  /* if no return value       */
                  if (cg.AArch64)
                  {
@@ -1287,8 +1576,63 @@ diff -ruN dmd-2.113.1/compiler/src/dmd/backend/x86/cgcod.d dmd-2.113.1/compiler/
                  {
 diff -ruN dmd-2.113.1/compiler/src/dmd/backend/x86/cod3.d dmd-2.113.1/compiler/src/dmd/backend/x86/cod3.d
 --- dmd-2.113.1/compiler/src/dmd/backend/x86/cod3.d	2026-10-31 15:30:53.000000000 +0100
-+++ dmd-2.113.1/compiler/src/dmd/backend/x86/cod3.d	2026-11-02 07:44:09.553437098 +0100
-@@ -1678,6 +1678,12 @@
++++ dmd-2.113.1/compiler/src/dmd/backend/x86/cod3.d	2026-11-02 08:52:01.565345973 +0100
+@@ -598,6 +598,23 @@
+ }
+ 
+ /**********************************
++ * How many AArch64 add/sub immediate instructions cod3_stackadj() emits.
++ * The two halves (bits [23:12] and bits [11:0]) are separate instructions.
++ */
++private int a64_stackadj_insns(int nbytes)
++{
++    if (nbytes == 0)
++        return 0;
++    uint imm = nbytes < 0 ? -nbytes : nbytes;
++    int n = 0;
++    if (imm >> 12)
++        ++n;
++    if (imm & ((1 << 12) - 1))
++        ++n;
++    return n;
++}
++
++/**********************************
+  * Generate code to align the stack pointer at `nbytes`
+  * Params:
+  *      cdb = code builder
+@@ -1006,13 +1023,28 @@
+     uint npush = gensaverestore(retregs,cdbs,cdbr);
+ 
+     if (STACKALIGN >= 16)
+-    {   npush += REGSIZE;
++    {
++        // x86 CALL pushes the return address. BL does not, so adding
++        // REGSIZE here leaves SP 8 bytes off for the finally block.
++        if (!cgstate.AArch64)
++            npush += REGSIZE;
+         if (npush & (STACKALIGN - 1))
+         {   nalign = STACKALIGN - (npush & (STACKALIGN - 1));
+             cod3_stackadj(cdbs, nalign);
+         }
+     }
+-    cdbs.genc(0xE8,0,FL.unde,0,FL.block,cast(targ_size_t)bf);
++    if (cgstate.AArch64)
++    {
++        // codout fills imm26 from FL.block. B/BL are not isBranch.
++        code cs;
++        cs.Iop = INSTR.bl(0);
++        cs.Iflags = 0;
++        cs.IFL1 = FL.block;
++        cs.IEV1.Vblock = bf;
++        cdbs.gen(&cs);
++    }
++    else
++        cdbs.genc(0xE8,0,FL.unde,0,FL.block,cast(targ_size_t)bf);
+     cgstate.regcon.immed.mval = 0;
+     if (nalign)
+         cod3_stackadj(cdbs, -nalign);
+@@ -1678,6 +1710,12 @@
              break;
  
          case TYcreal:
@@ -1301,7 +1645,7 @@ diff -ruN dmd-2.113.1/compiler/src/dmd/backend/x86/cod3.d dmd-2.113.1/compiler/s
              if (tyfb == TYjfunc && I32)
                  break;
              if (I32)
-@@ -1783,11 +1789,13 @@
+@@ -1783,11 +1821,13 @@
              goto case 4;
  
          case 16:
@@ -1316,7 +1660,86 @@ diff -ruN dmd-2.113.1/compiler/src/dmd/backend/x86/cod3.d dmd-2.113.1/compiler/s
              assert(!AArch64);
              if (tybasic(tym) == TYreal || tybasic(tym) == TYireal)
              {
-@@ -4823,6 +4831,63 @@
+@@ -3882,16 +3922,37 @@
+         if (config.fulltypes == CVDWARF_C || config.fulltypes == CVDWARF_D ||
+             config.ehmethod == EHmethod.EH_DWARF)
+         {
+-            int off = 2 * REGSIZE;      // 1 for the return address + 1 for the PUSH EBP
+-            dwarf_CFA_set_loc(1);           // address after PUSH EBP
+-            dwarf_CFA_set_reg_offset(SP, off); // CFA is now 8[ESP]
+-            dwarf_CFA_offset(BP, -off);       // EBP is at 0[ESP]
+-            dwarf_CFA_set_loc(I64 ? 4 : 3);   // address after MOV EBP,ESP
+-            /* Oddly, the CFA is not the same as the frame pointer,
+-             * which is why the offset of BP is set to 8
+-             */
+-            dwarf_CFA_set_reg_offset(BP, off);        // CFA is now 0[EBP]
+-            cfa_offset = off;  // remember the difference between the CFA and the frame pointer
++            if (cgstate.AArch64)
++            {
++                // CIE code alignment is 4, so set_loc takes instruction
++                // counts, not bytes. SP/BP (4/5) are x86 encodings; on
++                // AArch64 those dwarf numbers are X4/X5.
++                // STP writes x29 at [new SP] and x30 at [new SP+8].
++                // Incoming SP is the CFA. After `mov x29, sp`, keep CFA
++                // on x29 so later SP adjustments stay out of the unwinder.
++                const int frame = cast(int)(16 + xlocalsize);
++                const int loc = (16 + xlocalsize <= 512) ? 1 : a64_stackadj_insns(frame) + 1;
++                dwarf_CFA_set_loc(loc);              // after STP
++                dwarf_CFA_set_reg_offset(31, frame); // CFA = SP + frame
++                dwarf_CFA_offset(29, -frame);        // x29
++                dwarf_CFA_offset(30, 8 - frame);     // x30
++                dwarf_CFA_set_loc(loc + 1);          // after MOV x29, sp
++                dwarf_CFA_set_reg_offset(29, frame); // CFA = X29 + frame
++                cfa_offset = frame;
++            }
++            else
++            {
++                int off = 2 * REGSIZE;      // 1 for the return address + 1 for the PUSH EBP
++                dwarf_CFA_set_loc(1);           // address after PUSH EBP
++                dwarf_CFA_set_reg_offset(SP, off); // CFA is now 8[ESP]
++                dwarf_CFA_offset(BP, -off);       // EBP is at 0[ESP]
++                dwarf_CFA_set_loc(I64 ? 4 : 3);   // address after MOV EBP,ESP
++                /* Oddly, the CFA is not the same as the frame pointer,
++                 * which is why the offset of BP is set to 8
++                 */
++                dwarf_CFA_set_reg_offset(BP, off);        // CFA is now 0[EBP]
++                cfa_offset = off;  // remember the difference between the CFA and the frame pointer
++            }
+         }
+         enter = false;              /* do not use ENTER instruction */
+     }
+@@ -4034,6 +4095,7 @@
+     }
+ }
+ 
++@trusted
+ void prolog_frameadj2(ref CGstate cg, ref CodeBuilder cdb, tym_t tyf, uint xlocalsize, bool* pushalloc)
+ {
+     enum log = false;
+@@ -4043,6 +4105,22 @@
+         /* sub sp,sp,#xlocalsize
+          */
+         cod3_stackadj(cdb, xlocalsize);
++        if (xlocalsize &&
++            (config.fulltypes == CVDWARF_C || config.fulltypes == CVDWARF_D ||
++             config.ehmethod == EHmethod.EH_DWARF))
++        {
++            // No frame pointer. CFA stays SP, above the adjustment.
++            // set_loc is an instruction count (code alignment factor 4).
++            code* c = cdb.finish();
++            uint bytes = 0;
++            for (code* p = c; p; p = code_next(p))
++                bytes += calccodsize(p);
++            if (bytes)
++                dwarf_CFA_set_loc(bytes / 4);
++            dwarf_CFA_set_reg_offset(31, cast(int)xlocalsize);
++            cdb.reset();
++            cdb.append(c);
++        }
+         return;
+     }
+ 
+@@ -4823,6 +4901,63 @@
          }
          // MOV reg,param[BP]
          //assert(refparam);
@@ -1490,7 +1913,7 @@ diff -ruN dmd-2.113.1/compiler/src/dmd/glue/toir.d dmd-2.113.1/compiler/src/dmd/
      return op;
 diff -ruN dmd-2.113.1/compiler/src/dmd/link.d dmd-2.113.1/compiler/src/dmd/link.d
 --- dmd-2.113.1/compiler/src/dmd/link.d	2026-10-31 15:30:53.000000000 +0100
-+++ dmd-2.113.1/compiler/src/dmd/link.d	2026-10-31 18:45:30.965634144 +0100
++++ dmd-2.113.1/compiler/src/dmd/link.d	2026-11-02 10:15:07.097907210 +0100
 @@ -443,9 +443,10 @@
              return STATUS_FAILED;
          if (driverParams.symdebug)
