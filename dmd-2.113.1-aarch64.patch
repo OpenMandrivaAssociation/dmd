@@ -18,7 +18,7 @@ diff -ruN dmd-2.113.1/compiler/src/dmd/argtypes_aarch64.d dmd-2.113.1/compiler/s
      }
 diff -ruN dmd-2.113.1/compiler/src/dmd/backend/arm/cod1.d dmd-2.113.1/compiler/src/dmd/backend/arm/cod1.d
 --- dmd-2.113.1/compiler/src/dmd/backend/arm/cod1.d	2026-10-31 15:30:53.000000000 +0100
-+++ dmd-2.113.1/compiler/src/dmd/backend/arm/cod1.d	2026-11-02 23:01:45.153319432 +0100
++++ dmd-2.113.1/compiler/src/dmd/backend/arm/cod1.d	2026-11-03 01:08:28.721048397 +0100
 @@ -35,7 +35,7 @@
  import dmd.backend.rtlsym;
  import dmd.backend.ty;
@@ -161,7 +161,64 @@ diff -ruN dmd-2.113.1/compiler/src/dmd/backend/arm/cod1.d dmd-2.113.1/compiler/s
              }
              pcs.IEV1.Vsym = s;
              pcs.IEV1.Voffset = e.Voffset;
-@@ -1415,10 +1477,20 @@
+@@ -1328,15 +1390,47 @@
+         if (tycomplex(tym))
+         {
+             sz /= 2;
+-            assert(sz <= 8);            // TODO AArch64 16 byte floats
+-            const regm_t V0 = findreg(regm & INSTR.LSW);
+-            const regm_t V1 = findreg(regm & INSTR.MSW);
+-            const ftype = INSTR.szToFtype(sz);
+-            cdb.gen1(INSTR.fcmp_float(ftype,0,V0));             // FCMP V0,#0.0
+-            code* cnop = gen1(null, INSTR.nop);
+-            genBranch(cdb, COND.ne, FL.code, cast(block*)cnop); // B.ne cnop1;
+-            cdb.gen1(INSTR.fcmp_float(ftype,0,V1));             // FCMP V1,#0.0
+-            cdb.append(cnop);                                   // cnop1:
++            const reg_t V0 = findreg(regm & INSTR.LSW);
++            const reg_t V1 = findreg(regm & INSTR.MSW);
++            if (sz == 16)
++            {
++                // creal. szToFtype(16) is half and SIGILLs without FEAT_FP16.
++                // NE if either half is nonzero or NaN.
++                regm_t sr = cgstate.allregs & ~mask(0);
++                reg_t rs = allocreg(cdb, sr, TYint);
++                cdb.gen1(INSTR.sub_addsub_imm(1, 0, 32, 31, 31));      // SUB sp,sp,#32
++                cdb.gen1(INSTR.str_imm_fpsimd(0, 2, 0, 31, V0));
++                cdb.gen1(INSTR.str_imm_fpsimd(0, 2, 1, 31, V1));
++                cdb.gen1(INSTR.ldr_imm_fpsimd(0, 2, 0, 31, 32));        // v0 = real
++                cdb.gen1(INSTR.movi_advsimd(1, 1, 0xE, 0, 1));          // v1 = 0
++                regm_t dummy;
++                regm_t keep = mask(rs);
++                callclib(cdb, null, CLIB_A.netf2, dummy, keep);
++                cdb.gen1(INSTR.mov_register(0, 0, rs));                // MOV rs,w0
++                cdb.gen1(INSTR.ldr_imm_fpsimd(0, 2, 1, 31, 32));        // v0 = imag
++                cdb.gen1(INSTR.movi_advsimd(1, 1, 0xE, 0, 1));
++                callclib(cdb, null, CLIB_A.netf2, dummy, keep);
++                cdb.gen1(INSTR.orr_shifted_register(0, 0, rs, 0, 0, 0)); // ORR w0,w0,rs
++                gentstreg(cdb, 0, 0);                                  // CMP w0,#0
++                if (saveflag)
++                {
++                    // __netf2 clobbers v0-v7. Reload both halves; LDR does not
++                    // touch the flags just set by CMP.
++                    cdb.gen1(INSTR.ldr_imm_fpsimd(0, 2, 0, 31, V0));
++                    cdb.gen1(INSTR.ldr_imm_fpsimd(0, 2, 1, 31, V1));
++                }
++                cdb.gen1(INSTR.add_addsub_imm(1, 0, 32, 31, 31));      // ADD sp,sp,#32
++            }
++            else
++            {
++                assert(sz <= 8);            // TODO AArch64 16 byte floats
++                const ftype = INSTR.szToFtype(sz);
++                cdb.gen1(INSTR.fcmp_float(ftype,0,V0));             // FCMP V0,#0.0
++                code* cnop = gen1(null, INSTR.nop);
++                genBranch(cdb, COND.ne, FL.code, cast(block*)cnop); // B.ne cnop1;
++                cdb.gen1(INSTR.fcmp_float(ftype,0,V1));             // FCMP V1,#0.0
++                cdb.append(cnop);                                   // cnop1:
++            }
+         }
+         else if (sz == 16)              // 128 byte floats
+         {
+@@ -1415,10 +1509,20 @@
              // should fix genmovreg() to do this work
              if (tyfloating(tym))
              {
@@ -185,7 +242,7 @@ diff -ruN dmd-2.113.1/compiler/src/dmd/backend/arm/cod1.d dmd-2.113.1/compiler/s
              }
              else
              {
-@@ -1433,13 +1505,22 @@
+@@ -1433,13 +1537,22 @@
              reg_t Vn = findreg(retregs);
              reg_t Vd = allocreg(cdb, outretregs, tym);  // allocate return regs
              //printf("Vn: %d Vd: %d\n", Vn, Vd);
@@ -209,7 +266,7 @@ diff -ruN dmd-2.113.1/compiler/src/dmd/backend/arm/cod1.d dmd-2.113.1/compiler/s
                  cdb.gen1(INSTR.fmov(ftype,Vn,Vd));  // FMOV Vd,Vn
              }
          }
-@@ -1468,6 +1549,7 @@
+@@ -1468,6 +1581,7 @@
  {
      realToDouble,
      doubleToReal,
@@ -217,7 +274,7 @@ diff -ruN dmd-2.113.1/compiler/src/dmd/backend/arm/cod1.d dmd-2.113.1/compiler/s
      add,
      min,
      mul,
-@@ -1554,6 +1636,15 @@
+@@ -1554,6 +1668,15 @@
              break;
          }
  
@@ -233,13 +290,12 @@ diff -ruN dmd-2.113.1/compiler/src/dmd/backend/arm/cod1.d dmd-2.113.1/compiler/s
          case CLIB_A.add:
          {
              string name = "__addtf3";
-@@ -1645,8 +1736,65 @@
+@@ -1645,8 +1768,65 @@
   *      keepmask = mask of registers not to destroy. Saves/restores them
   */
  
 +/* MOV Vd.16B, Vn.16B. Scalar FMOV cannot copy a 128-bit real. */
- @trusted
--void callclib(ref CodeBuilder cdb, elem* e, uint clib, ref regm_t pretregs, regm_t keepmask)
++@trusted
 +private void moveQuad(ref CodeBuilder cdb, reg_t to, reg_t from)
 +{
 +    if (to != from)
@@ -294,13 +350,14 @@ diff -ruN dmd-2.113.1/compiler/src/dmd/backend/arm/cod1.d dmd-2.113.1/compiler/s
 +        moveQuad(cdb, v1, src1);
 +}
 +
-+@trusted
+ @trusted
+-void callclib(ref CodeBuilder cdb, elem* e, uint clib, ref regm_t pretregs, regm_t keepmask)
 +void callclib(ref CodeBuilder cdb, elem* e, uint clib, ref regm_t pretregs, regm_t keepmask,
 +              reg_t src0 = NOREG, reg_t src1 = NOREG)
  {
      //printf("callclib(e = %p, clib = %d, pretregs = %s, keepmask = %s\n", e, clib, regm_str(pretregs), regm_str(keepmask));
      //elem_print(e);
-@@ -1673,7 +1821,15 @@
+@@ -1673,7 +1853,15 @@
          }
      }
  
@@ -316,7 +373,7 @@ diff -ruN dmd-2.113.1/compiler/src/dmd/backend/arm/cod1.d dmd-2.113.1/compiler/s
      if (nalign)
          cod3_stackadj(cdb, -nalign);
      cgstate.calledafunc = 1;
-@@ -1827,6 +1983,14 @@
+@@ -1827,6 +2015,14 @@
          if (alignsize > STACKALIGN)
              alignsize = STACKALIGN;         // no point if the stack is less aligned
  
@@ -331,7 +388,7 @@ diff -ruN dmd-2.113.1/compiler/src/dmd/backend/arm/cod1.d dmd-2.113.1/compiler/s
          /* Alignment on OSX64 AArch64 is the same as for struct fields.
           * If it is a variadic function, the last parameter (lastPar) is aligned on 8 bytes.
           * Match behavior in backend.arm.cod1.cdfunc()
-@@ -1838,7 +2002,10 @@
+@@ -1838,7 +2034,10 @@
  
          p.offset = numpara;
          //printf("[%d] param offset =  x%x, alignsize = %d\n", i, cast(int) numpara, cast(int) alignsize);
@@ -343,7 +400,7 @@ diff -ruN dmd-2.113.1/compiler/src/dmd/backend/arm/cod1.d dmd-2.113.1/compiler/s
      }
  
      //printf("numpara: %d STACKALIGN: %d\n", numpara, STACKALIGN);
-@@ -2168,12 +2335,18 @@
+@@ -2168,12 +2367,18 @@
          {
              s = getRtlsym(RTLSYM.ALLOCA);
              makeitextern(s);
@@ -368,7 +425,7 @@ diff -ruN dmd-2.113.1/compiler/src/dmd/backend/arm/cod1.d dmd-2.113.1/compiler/s
          }
          if (sytab[s.Sclass] & SCSS)    // if function is on stack (!)
          {
-@@ -2443,6 +2616,9 @@
+@@ -2443,6 +2648,9 @@
      scodelem(cgstate,cdb, e, retregs, 0, true);
      if (isPair)
      {
@@ -378,7 +435,7 @@ diff -ruN dmd-2.113.1/compiler/src/dmd/backend/arm/cod1.d dmd-2.113.1/compiler/s
          uint szx = cast(uint)tysize(tym) / 2;
          const reg_t rmsw = findreg(retregs & INSTR.MSW);
          code cs;
-@@ -2450,14 +2626,14 @@
+@@ -2450,14 +2658,14 @@
          cs.base = INSTR.SP;
          cs.index = NOREG;
          cs.IFL1 = FL.offset;
@@ -396,7 +453,7 @@ diff -ruN dmd-2.113.1/compiler/src/dmd/backend/arm/cod1.d dmd-2.113.1/compiler/s
          cs.IEV1.Voffset = funcargtos;
          cdb.gen(&cs);
      }
-@@ -2613,6 +2789,16 @@
+@@ -2613,6 +2821,16 @@
      }
      else
      {
@@ -413,7 +470,7 @@ diff -ruN dmd-2.113.1/compiler/src/dmd/backend/arm/cod1.d dmd-2.113.1/compiler/s
          // See if we can use register that parameter was passed in
          //printf("xyzzy1 %s %d %d\n", e.Vsym.Sident.ptr, cast(int)cgstate.regcon.params, regParamInPreg(e.Vsym));
          if (cgstate.regcon.params &&
-@@ -2620,7 +2806,10 @@
+@@ -2620,7 +2838,10 @@
              !cgstate.anyiasm &&   // may have written to the memory for the parameter
              (cgstate.regcon.params & mask(e.Vsym.Spreg) && e.Voffset == 0 ||
               cgstate.regcon.params & mask(e.Vsym.Spreg2) && e.Voffset == REGSIZE) &&
@@ -426,8 +483,8 @@ diff -ruN dmd-2.113.1/compiler/src/dmd/backend/arm/cod1.d dmd-2.113.1/compiler/s
              const reg_t preg = e.Voffset ? e.Vsym.Spreg2 : e.Vsym.Spreg;
              const regm_t pregm = mask(preg);
 diff -ruN dmd-2.113.1/compiler/src/dmd/backend/arm/cod2.d dmd-2.113.1/compiler/src/dmd/backend/arm/cod2.d
---- dmd-2.113.1/compiler/src/dmd/backend/arm/cod2.d
-+++ dmd-2.113.1/compiler/src/dmd/backend/arm/cod2.d
+--- dmd-2.113.1/compiler/src/dmd/backend/arm/cod2.d	2026-10-31 15:30:53.000000000 +0100
++++ dmd-2.113.1/compiler/src/dmd/backend/arm/cod2.d	2026-11-03 00:56:16.871674204 +0100
 @@ -163,7 +163,8 @@
                  default:
                      assert(0);
@@ -457,7 +514,91 @@ diff -ruN dmd-2.113.1/compiler/src/dmd/backend/arm/cod2.d dmd-2.113.1/compiler/s
              cdb.gen1(INSTR.addsub_ext(sf, op, S, opt, Rm, option, imm3, Rn, Rd));
              PSW = 0;
              pretregs &= ~mPSW;
-@@ -538,7 +551,8 @@
+@@ -502,18 +515,44 @@
+         codelem(cgstate,cdb,e.E1,retregs1,1);
+         const d0 = findreg(retregs1 & INSTR.LSW);
+         const d1 = findreg(retregs1 & INSTR.MSW);
+-        const ftype = INSTR.szToFtype(sz / 2);
+-        cdb.gen1(INSTR.fcmp_float(ftype,0,d1));     // FCMP d1,#0.0 https://www.scs.stanford.edu/~zyedidia/arm64/fcmp_float.html
+-        cdb.gen1(INSTR.movi_advsimd(0,1,0xE,0,d1)); // MOVI d1,#0x0 https://www.scs.stanford.edu/~zyedidia/arm64/movi_advsimd.html
+-        const cond = 0;                             // eq
+-        const nzcv = 0;                             // #<nzcv>
+-        cdb.gen1(INSTR.fccmp_float(ftype,d1,cond,d0,nzcv)); // FCCMP d0,d1,#0x0,eq https://www.scs.stanford.edu/~zyedidia/arm64/fccmp_float.html
+-
+         regm_t retregs = pretregs & cgstate.allregs;
+         if (!retregs)
+             retregs = cgstate.allregs;
++        // __netf2 returns in x0. Keep the boolean out of x0 across that call.
++        if (sz / 2 == 16)
++            retregs &= ~mask(0);
++        if (!retregs)
++            retregs = cgstate.allregs & ~mask(0);
+         const Rd = allocreg(cdb, retregs, tybasic(e.Ety));
+         const condx = op == OPnot ? COND.ne : COND.eq;
++        if (sz / 2 == 16)
++        {
++            // creal. szToFtype(16) is half; FCMPE H is SIGILL without FEAT_FP16.
++            // True when either half is nonzero or NaN: OR the two __netf2 results.
++            cdb.gen1(INSTR.sub_addsub_imm(1, 0, 32, 31, 31));       // SUB sp,sp,#32
++            cdb.gen1(INSTR.str_imm_fpsimd(0, 2, 0, 31, d0));        // STR q, [sp]
++            cdb.gen1(INSTR.str_imm_fpsimd(0, 2, 1, 31, d1));        // STR q, [sp,#16]
++            cdb.gen1(INSTR.ldr_imm_fpsimd(0, 2, 1, 31, 32));        // LDR q0, [sp,#16]
++            cdb.gen1(INSTR.movi_advsimd(1, 1, 0xE, 0, 1));          // MOVI v1.2d, #0
++            regm_t dummy;
++            callclib(cdb, null, CLIB_A.netf2, dummy, mask(Rd));
++            cdb.gen1(INSTR.mov_register(0, 0, Rd));                 // MOV Rd,w0
++            cdb.gen1(INSTR.ldr_imm_fpsimd(0, 2, 0, 31, 32));        // LDR q0, [sp]
++            cdb.gen1(INSTR.movi_advsimd(1, 1, 0xE, 0, 1));          // MOVI v1.2d, #0
++            callclib(cdb, null, CLIB_A.netf2, dummy, mask(Rd));
++            cdb.gen1(INSTR.orr_shifted_register(0, 0, Rd, 0, 0, 0)); // ORR w0,w0,Rd
++            gentstreg(cdb, 0, 0);                                   // CMP w0,#0
++            cdb.gen1(INSTR.add_addsub_imm(1, 0, 32, 31, 31));       // ADD sp,sp,#32
++        }
++        else
++        {
++            const ftype = INSTR.szToFtype(sz / 2);
++            cdb.gen1(INSTR.fcmp_float(ftype,0,d1));     // FCMP d1,#0.0 https://www.scs.stanford.edu/~zyedidia/arm64/fcmp_float.html
++            cdb.gen1(INSTR.movi_advsimd(0,1,0xE,0,d1)); // MOVI d1,#0x0 https://www.scs.stanford.edu/~zyedidia/arm64/movi_advsimd.html
++            const cond = 0;                             // eq
++            const nzcv = 0;                             // #<nzcv>
++            cdb.gen1(INSTR.fccmp_float(ftype,d1,cond,d0,nzcv)); // FCCMP d0,d1,#0x0,eq https://www.scs.stanford.edu/~zyedidia/arm64/fccmp_float.html
++        }
+         sz = tysize(e.Ety);
+         cdb.gen1(INSTR.cset(sz == 8,condx,Rd));     // CSET Rd,eq  https://www.scs.stanford.edu/~zyedidia/arm64/cset_csinc.html
+         //uint N,immr,imms;
+@@ -527,18 +566,38 @@
+         regm_t retregs1 = INSTR.FLOATREGS;
+         codelem(cgstate,cdb,e.E1,retregs1,1);
+         const V1 = findreg(retregs1);
+-        const ftype = INSTR.szToFtype(sz);
+-        cdb.gen1(INSTR.fcmpe_float(ftype,0,V1));        // FCMPE V1,#0.0
+ 
+         regm_t retregs = pretregs & cgstate.allregs;
+         if (!retregs)
+             retregs = cgstate.allregs;
++        if (sz == 16)
++            retregs &= ~mask(0);                // __netf2 returns in x0
++        if (!retregs)
++            retregs = cgstate.allregs & ~mask(0);
+         const Rd = allocreg(cdb, retregs, tybasic(e.Ety));
+         const cond = op == OPnot ? COND.ne : COND.eq;
++        if (sz == 16)
++        {
++            // binary128. szToFtype(16) encodes FCMPE as half precision,
++            // which is SIGILL on a CPU without FEAT_FP16 (Cortex-A72).
++            // __netf2(x, 0) is nonzero when x is nonzero or NaN.
++            regm_t zm = INSTR.FLOATREGS & ~mask(V1) & ~mask(32) & ~mask(33);
++            reg_t zreg = allocreg(cdb, zm, TYreal);
++            cdb.gen1(INSTR.movi_advsimd(1, 1, 0xE, 0, zreg)); // MOVI zreg.2d, #0
++            regm_t dummy;
++            callclib(cdb, null, CLIB_A.netf2, dummy, mask(Rd), V1, zreg);
++            gentstreg(cdb, 0, 0);                             // CMP w0,#0
++        }
++        else
++        {
++            const ftype = INSTR.szToFtype(sz);
++            cdb.gen1(INSTR.fcmpe_float(ftype,0,V1));        // FCMPE V1,#0.0
++        }
          sz = tysize(e.Ety);
          cdb.gen1(INSTR.cset(sz == 8,cond,Rd));          // CSET Rd,eq
          uint N,immr,imms;
@@ -467,7 +608,7 @@ diff -ruN dmd-2.113.1/compiler/src/dmd/backend/arm/cod2.d dmd-2.113.1/compiler/s
          cdb.gen1(INSTR.log_imm(0,0,0,immr,imms,Rd,Rd)); // AND Rd,Rd,#0xFF
          pretregs &= ~mPSW;                              // flags already set
          fixresult(cdb,e,retregs,pretregs);
-@@ -557,15 +571,19 @@
+@@ -557,15 +616,19 @@
          const tym = tybasic(e.Ety);
          reg_t Rd = allocreg(cdb, retregs, tym); // destination register
  
@@ -491,7 +632,7 @@ diff -ruN dmd-2.113.1/compiler/src/dmd/backend/arm/cod2.d dmd-2.113.1/compiler/s
          cdb.gen1(INSTR.log_imm(0,0,0,immr,imms,Rd,Rd)); // AND Rd,Rd,#0xFF
  
          fixresult(cdb,e,retregs,pretregs);
-@@ -1179,7 +1197,10 @@
+@@ -1179,7 +1242,10 @@
          return;
      }
      const tym = tybasic(e.Ety);
@@ -503,7 +644,7 @@ diff -ruN dmd-2.113.1/compiler/src/dmd/backend/arm/cod2.d dmd-2.113.1/compiler/s
      const uns  = tyuns(tym) != 0;
  
      const tym1 = tybasic(e.E1.Ety);
-@@ -1191,6 +1212,20 @@
+@@ -1191,6 +1257,20 @@
      const Rn = findreg(retregs1);           // Rn is the pointer
  
      bool isPair = isRegisterPair(true, tym, 0);
@@ -524,7 +665,7 @@ diff -ruN dmd-2.113.1/compiler/src/dmd/backend/arm/cod2.d dmd-2.113.1/compiler/s
  
      if (tyfloating(tym))
      {
-@@ -1300,7 +1335,6 @@
+@@ -1300,7 +1380,6 @@
          case decode(8, 8, 0):
          case decode(8, 8, 1): size = 3; opc = 1; break; // ldr 64
          default:
@@ -532,7 +673,7 @@ diff -ruN dmd-2.113.1/compiler/src/dmd/backend/arm/cod2.d dmd-2.113.1/compiler/s
              assert(0);
      }
  
-@@ -1371,6 +1405,9 @@
+@@ -1371,6 +1450,9 @@
      //printf("s1: %d s2: n: %d Rr: %d Ri: %d Rv1: %d Rv2: %d\n", s1,s2,Rn,Rr,Ri,Rv1,Rv2);
  
      movregconst(cdb,Rr,0,pretregs & mPSW);      // MOV Rr,0 setting flags in case Rn is zero
@@ -542,7 +683,7 @@ diff -ruN dmd-2.113.1/compiler/src/dmd/backend/arm/cod2.d dmd-2.113.1/compiler/s
  
      code* cnop1 = gen1(null, INSTR.nop);        // branch target L1
      code* cnop2 = gen1(null, INSTR.nop);        // branch target L2
-@@ -1380,6 +1417,7 @@
+@@ -1380,6 +1462,7 @@
      genCompBranch(cdb,1,Rn,false,FL.code,cast(block*) cnop2);   // CBZ Rn,L2
  
      movregconst(cdb,Ri,0,0);                    // MOV Ri,0
@@ -550,7 +691,7 @@ diff -ruN dmd-2.113.1/compiler/src/dmd/backend/arm/cod2.d dmd-2.113.1/compiler/s
  
      cdb.append(cnop1);                          // L1:
  
-@@ -1762,7 +1800,10 @@
+@@ -1762,7 +1845,10 @@
      else
      {
          assert(szv == 4 || szv == 8);
@@ -562,7 +703,7 @@ diff -ruN dmd-2.113.1/compiler/src/dmd/backend/arm/cod2.d dmd-2.113.1/compiler/s
      }
      code* L2 = cdb.last();
      if (szv == REGSIZE * 2)
-@@ -1812,10 +1853,12 @@
+@@ -1812,10 +1898,12 @@
          codelem(cgstate,cdb,e2,srcregs,false);
      }
  
@@ -578,7 +719,7 @@ diff -ruN dmd-2.113.1/compiler/src/dmd/backend/arm/cod2.d dmd-2.113.1/compiler/s
      if (e1.Eoper == OPind)               // if (*p = ..)
      {
          scodelem(cg,cdb,e1.E1,dstregs,srcregs,false);
-@@ -1861,7 +1904,7 @@
+@@ -1861,7 +1949,7 @@
              loadFromEA(csrc,Rv,4,4);
              cdb.genc1(csrc.Iop,0,FL.offset,offset);
              storeToEA(cdst,Rv,4);
@@ -587,7 +728,7 @@ diff -ruN dmd-2.113.1/compiler/src/dmd/backend/arm/cod2.d dmd-2.113.1/compiler/s
              offset += 4;
              numbytes -= 4;
          }
-@@ -1871,7 +1914,7 @@
+@@ -1871,7 +1959,7 @@
              loadFromEA(csrc,Rv,4,2);
              cdb.genc1(csrc.Iop,0,FL.offset,offset);
              storeToEA(cdst,Rv,2);
@@ -596,7 +737,7 @@ diff -ruN dmd-2.113.1/compiler/src/dmd/backend/arm/cod2.d dmd-2.113.1/compiler/s
              offset += 2;
              numbytes -= 2;
          }
-@@ -1881,7 +1924,7 @@
+@@ -1881,7 +1969,7 @@
              loadFromEA(csrc,Rv,4,1);
              cdb.genc1(csrc.Iop,0,FL.offset,offset);
              storeToEA(cdst,Rv,1);
@@ -605,7 +746,7 @@ diff -ruN dmd-2.113.1/compiler/src/dmd/backend/arm/cod2.d dmd-2.113.1/compiler/s
          }
      }
      else
-@@ -1919,6 +1962,10 @@
+@@ -1919,6 +2007,10 @@
  
          movregconst(cdb,Rc,numbytes * 8,0);             // mov   Rc,#count * 8
          movregconst(cdb,Ri,0,0);                        // mov   Ri,0
@@ -616,7 +757,7 @@ diff -ruN dmd-2.113.1/compiler/src/dmd/backend/arm/cod2.d dmd-2.113.1/compiler/s
  
          loadFromEA(csrc,Rv,8,8);                        // L2:   ldr Rv,[Rs,Ri]
          cdb.genc1(csrc.Iop,0,FL.unde,0);
-@@ -2051,6 +2098,26 @@
+@@ -2051,6 +2143,26 @@
   * reg.
   */
  
@@ -643,7 +784,7 @@ diff -ruN dmd-2.113.1/compiler/src/dmd/backend/arm/cod2.d dmd-2.113.1/compiler/s
  @trusted
  void getoffset(ref CGstate cg, ref CodeBuilder cdb,elem* e,reg_t reg)
  {
-@@ -2084,6 +2151,20 @@
+@@ -2084,6 +2196,20 @@
              if (config.exe & EX_posix)
              {
                  if (log) printf("posix threaded\n");
@@ -664,7 +805,7 @@ diff -ruN dmd-2.113.1/compiler/src/dmd/backend/arm/cod2.d dmd-2.113.1/compiler/s
                  uint ins = INSTR.systemmove(1,INSTR.tpidr_el0,reg); // MRS reg,tpidr_el0
                  cdb.gen1(ins);
  
-@@ -2093,6 +2174,7 @@
+@@ -2093,6 +2219,7 @@
                  ins = INSTR.addsub_imm(1,0,0,0,0,reg,reg);          // ADD reg,reg,#0
                  cdb.gencs1(ins,0,fl,e.Vsym);
                  cdb.last.Iflags |= CFadd;
@@ -672,7 +813,7 @@ diff -ruN dmd-2.113.1/compiler/src/dmd/backend/arm/cod2.d dmd-2.113.1/compiler/s
                  return;
              }
              assert(0);
-@@ -2228,7 +2310,9 @@
+@@ -2228,7 +2355,9 @@
              goto L4;
  
          case FL.extern_:
@@ -683,7 +824,7 @@ diff -ruN dmd-2.113.1/compiler/src/dmd/backend/arm/cod2.d dmd-2.113.1/compiler/s
              {
                  if (log) printf("posix extern threaded\n");
                  regm_t scratch = INSTR.ALLREGS & ~mask(reg);
-@@ -2236,14 +2320,15 @@
+@@ -2236,14 +2365,15 @@
                  uint ins = INSTR.systemmove(1,INSTR.tpidr_el0,r);  // MRS r,tpidr_el0
                  cdb.gen1(ins);
  
@@ -702,7 +843,7 @@ diff -ruN dmd-2.113.1/compiler/src/dmd/backend/arm/cod2.d dmd-2.113.1/compiler/s
                  return;
              }
  //            if (config.exe & EX_WIN64 && e.Vsym.ty() & mTYthread)
-@@ -2274,16 +2359,41 @@
+@@ -2274,16 +2404,41 @@
              }
              else
              {
@@ -754,7 +895,7 @@ diff -ruN dmd-2.113.1/compiler/src/dmd/backend/arm/cod2.d dmd-2.113.1/compiler/s
              }
              break;
  
-@@ -2404,7 +2514,8 @@
+@@ -2404,7 +2559,8 @@
              // https://www.scs.stanford.edu/~zyedidia/arm64/fmov_float_gen.html
              cdb.gen1(INSTR.fmov_float_gen(1,2,1,6,Vn,Xn)); // Top half of 128-bit to 64-bit
              uint N, immr, imms;
@@ -764,7 +905,7 @@ diff -ruN dmd-2.113.1/compiler/src/dmd/backend/arm/cod2.d dmd-2.113.1/compiler/s
              uint sf = 1, opc = 2;
              cdb.gen1(INSTR.log_imm(sf,opc,N,immr,imms,Xn,Xn)); // https://www.scs.stanford.edu/~zyedidia/arm64/eor_log_imm.html
              cdb.gen1(INSTR.fmov_float_gen(1,2,1,7,Xn,Vn)); // 64-bit to top half of 128-bit
-@@ -2481,7 +2592,8 @@
+@@ -2481,7 +2637,8 @@
              // https://www.scs.stanford.edu/~zyedidia/arm64/fmov_float_gen.html
              cdb.gen1(INSTR.fmov_float_gen(1,2,1,6,Vn,Xn)); // Top half of 128-bit to 64-bit
              uint N, immr, imms;
@@ -774,7 +915,7 @@ diff -ruN dmd-2.113.1/compiler/src/dmd/backend/arm/cod2.d dmd-2.113.1/compiler/s
              uint sf = 1, opc = 0;
              cdb.gen1(INSTR.log_imm(sf,opc,N,immr,imms,Xn,Xn)); // https://www.scs.stanford.edu/~zyedidia/arm64/eor_log_imm.html
              cdb.gen1(INSTR.fmov_float_gen(1,2,1,7,Xn,Vn)); // 64-bit to top half of 128-bit
-@@ -2532,7 +2644,10 @@
+@@ -2532,7 +2689,10 @@
      op = 1;
      S = 0;
      uint Rm = Rn;
@@ -786,7 +927,7 @@ diff -ruN dmd-2.113.1/compiler/src/dmd/backend/arm/cod2.d dmd-2.113.1/compiler/s
      uint o2 = 1;
      ins = (sf     << 31) |
            (op     << 30) |
-@@ -2595,8 +2710,9 @@
+@@ -2595,8 +2755,9 @@
      {
          gentstreg(cdb,cs.reg,sz == 8);          // CMP cs.reg,#0
  
@@ -798,7 +939,7 @@ diff -ruN dmd-2.113.1/compiler/src/dmd/backend/arm/cod2.d dmd-2.113.1/compiler/s
  
          const n = e2.Vint;
          uint opx = e.Eoper == OPpostinc ? 0 : 1;
-@@ -2624,8 +2740,12 @@
+@@ -2624,8 +2785,12 @@
              pretregs &= ~mPSW;
          }
  
@@ -1236,7 +1377,7 @@ diff -ruN dmd-2.113.1/compiler/src/dmd/backend/arm/cod3.d dmd-2.113.1/compiler/s
                  default:
 diff -ruN dmd-2.113.1/compiler/src/dmd/backend/arm/cod4.d dmd-2.113.1/compiler/src/dmd/backend/arm/cod4.d
 --- dmd-2.113.1/compiler/src/dmd/backend/arm/cod4.d	2026-10-31 15:30:53.000000000 +0100
-+++ dmd-2.113.1/compiler/src/dmd/backend/arm/cod4.d	2026-11-02 22:09:24.472763745 +0100
++++ dmd-2.113.1/compiler/src/dmd/backend/arm/cod4.d	2026-11-03 00:56:16.871674204 +0100
 @@ -43,7 +43,7 @@
  import dmd.backend.x86.xmm;
  import dmd.backend.arm.cod1 : getlvalue, loadFromEA, storeToEA,CLIB_A,callclib;
@@ -1302,7 +1443,24 @@ diff -ruN dmd-2.113.1/compiler/src/dmd/backend/arm/cod4.d dmd-2.113.1/compiler/s
      }
      freenode(e1);
  }
-@@ -424,7 +441,11 @@
+@@ -352,10 +369,14 @@
+         uint szw = sz == 8 ? 8 : 4;
+         loadFromEA(cs, reg, szw, sz);
+         cdb.gen(&cs);
+-        // negate reg
++        // NEG Rd,Rm. cs.reg is NOREG (57) for a memory EA. Rd is a 5-bit
++        // field, so 57 encodes as w25, the negated value is discarded, and
++        // storeToEA writes the original register. A thunk's `d = -d` then
++        // keeps the sign-extended offset and emits an undefined instruction.
++        // `reg` is the register just loaded and the one the store writes.
+         uint sf = sz == 8;
+         uint S = forccs != 0;
+-        uint ins = INSTR.neg_sub_addsub_shift(sf,S,0,reg,0,cs.reg);
++        uint ins = INSTR.neg_sub_addsub_shift(sf,S,0,reg,0,reg);
+         cdb.gen1(ins);
+         storeToEA(cs, reg, sz);
+         cdb.gen(&cs);
+@@ -424,7 +445,11 @@
          uint imm3 = 0;                // shift amount
          uint S = forccs != 0;
          uint opt = 0;
@@ -1314,7 +1472,7 @@ diff -ruN dmd-2.113.1/compiler/src/dmd/backend/arm/cod4.d dmd-2.113.1/compiler/s
          reg_t Rm = reg2;
          reg_t Rn = reg1;
          reg_t Rd = reg1;
-@@ -710,7 +731,11 @@
+@@ -710,7 +735,11 @@
          }
          regm_t idxregs = idxregm(cs);  // save index registers so we can do the storeToEA() later
          regm_t dummy;
@@ -1327,7 +1485,77 @@ diff -ruN dmd-2.113.1/compiler/src/dmd/backend/arm/cod4.d dmd-2.113.1/compiler/s
      }
      else
      {
-@@ -1147,7 +1172,7 @@
+@@ -1094,10 +1123,36 @@
+             reg_t reg2lsw = findreg(retregs2 & INSTR.LSW);
+             reg_t reg2msw = findreg(retregs2 & INSTR.MSW);
+ 
+-            const uint ftype = INSTR.szToFtype(sz / 2);
+-            cdb.gen1(INSTR.fcmp_float(ftype,reg2lsw,reg1lsw));     // FCMP reg1lsw,reg2lsw https://www.scs.stanford.edu/~zyedidia/arm64/fcmp_float.html
+-            cdb.gen1(INSTR.fccmp_float(ftype,reg2msw,jop,reg1msw,0)); // FCCMP reg1msw,reg2msw,#0x0,eq https://www.scs.stanford.edu/~zyedidia/arm64/fccmp_float.html
+-                // CSET w0,eq
++            if (sz / 2 == 16)
++            {
++                // creal. Each half is binary128. Compare both with __eqtf2
++                // and OR the results: 0 iff both halves are equal.
++                regm_t saveregs = cgstate.allregs & ~mask(0);
++                reg_t rs = allocreg(cdb, saveregs, TYint);
++                cdb.gen1(INSTR.sub_addsub_imm(1, 0, 64, 31, 31));    // SUB sp,sp,#64
++                cdb.gen1(INSTR.str_imm_fpsimd(0, 2, 0, 31, reg1lsw));
++                cdb.gen1(INSTR.str_imm_fpsimd(0, 2, 1, 31, reg1msw));
++                cdb.gen1(INSTR.str_imm_fpsimd(0, 2, 2, 31, reg2lsw));
++                cdb.gen1(INSTR.str_imm_fpsimd(0, 2, 3, 31, reg2msw));
++                cdb.gen1(INSTR.ldr_imm_fpsimd(0, 2, 0, 31, 32));      // v0 = re1
++                cdb.gen1(INSTR.ldr_imm_fpsimd(0, 2, 2, 31, 33));      // v1 = re2
++                regm_t dummy;
++                callclib(cdb, null, CLIB_A.eqtf2, dummy, mask(rs));
++                cdb.gen1(INSTR.mov_register(0, 0, rs));              // MOV rs,w0
++                cdb.gen1(INSTR.ldr_imm_fpsimd(0, 2, 1, 31, 32));      // v0 = im1
++                cdb.gen1(INSTR.ldr_imm_fpsimd(0, 2, 3, 31, 33));      // v1 = im2
++                callclib(cdb, null, CLIB_A.eqtf2, dummy, mask(rs));
++                cdb.gen1(INSTR.orr_shifted_register(0, 0, rs, 0, 0, 0)); // ORR w0,w0,rs
++                gentstreg(cdb, 0, 0);                                // CMP w0,#0
++                cdb.gen1(INSTR.add_addsub_imm(1, 0, 64, 31, 31));    // ADD sp,sp,#64
++            }
++            else
++            {
++                const uint ftype = INSTR.szToFtype(sz / 2);
++                cdb.gen1(INSTR.fcmp_float(ftype,reg2lsw,reg1lsw));     // FCMP reg1lsw,reg2lsw https://www.scs.stanford.edu/~zyedidia/arm64/fcmp_float.html
++                cdb.gen1(INSTR.fccmp_float(ftype,reg2msw,jop,reg1msw,0)); // FCCMP reg1msw,reg2msw,#0x0,eq https://www.scs.stanford.edu/~zyedidia/arm64/fccmp_float.html
++                    // CSET w0,eq
++            }
+         }
+         else
+         {
+@@ -1119,6 +1174,28 @@
+                 gentstreg(cdb,0,0);                          // CMP w0,#0
+                 assert(0);      // TODO AArch64 registers not right for library call
+             }
++            else if (sz == 16)
++            {
++                // binary128 has no scalar FCMP. szToFtype(16) is half and
++                // SIGILLs without FEAT_FP16. libgcc's __*tf2 result compared
++                // with 0 matches the signed condition in jop.
++                CLIB_A clib;
++                switch (jop)
++                {
++                    case COND.eq: clib = CLIB_A.eqtf2; break;
++                    case COND.ne: clib = CLIB_A.netf2; break;
++                    case COND.lt: clib = CLIB_A.lttf2; break;
++                    case COND.le: clib = CLIB_A.letf2; break;
++                    case COND.gt: clib = CLIB_A.gttf2; break;
++                    case COND.ge: clib = CLIB_A.getf2; break;
++                    default:      clib = CLIB_A.netf2; break;
++                }
++                reg_t reg1 = findreg(retregs1);
++                reg_t reg2 = findreg(retregs2);
++                regm_t dummy;
++                callclib(cdb, null, clib, dummy, 0, reg1, reg2);
++                gentstreg(cdb, 0, 0);                            // CMP w0,#0
++            }
+             else
+             {
+                 reg_t reg1 = findreg(retregs1);
+@@ -1147,7 +1224,7 @@
                  rreg = findreg(rretregs & INSTR.MSW);
                  uint ins = INSTR.cmp_subs_addsub_shift(1, rreg, 0, 0, reg); // CMP reg, rreg
                  cdb.gen1(ins);
@@ -1336,7 +1564,7 @@ diff -ruN dmd-2.113.1/compiler/src/dmd/backend/arm/cod4.d dmd-2.113.1/compiler/s
  
                  reg = findreg(retregs & INSTR.LSW);
                  rreg = findreg(rretregs & INSTR.LSW);
-@@ -1565,10 +1590,10 @@
+@@ -1565,10 +1642,10 @@
      {
          case OPd_s16:                               // fcvtzs w0,d31  // sxth w0,w0
          case OPd_s32: ftype = 1; sf = 0; goto L2;   // fcvtzs w0,d31
@@ -1349,7 +1577,7 @@ diff -ruN dmd-2.113.1/compiler/src/dmd/backend/arm/cod4.d dmd-2.113.1/compiler/s
          L2:
              regm_t retregs1 = INSTR.FLOATREGS;
              codelem(cgstate,cdb,e.E1,retregs1,false);
-@@ -1590,21 +1615,22 @@
+@@ -1590,21 +1667,22 @@
                      cdb.gen1(INSTR.fcvtzs(0,1,V1,Rd));                  // fcvtzs Rd,V1
                      break;
                  case OPd_s64:
@@ -1377,7 +1605,7 @@ diff -ruN dmd-2.113.1/compiler/src/dmd/backend/arm/cod4.d dmd-2.113.1/compiler/s
                      break;
                  default:
                      assert(0);
-@@ -1642,7 +1668,8 @@
+@@ -1642,7 +1720,8 @@
                  case OPu16_d:
                      /* not executed because OPu16_d was converted to OPu16_32 then OP32_d */
                      uint N,immr,imms;
@@ -1387,7 +1615,7 @@ diff -ruN dmd-2.113.1/compiler/src/dmd/backend/arm/cod4.d dmd-2.113.1/compiler/s
                      cdb.gen1(INSTR.log_imm(0,0,0,immr,imms,Rn,Rn)); // and w0,w0,#0xFFFF
                      cdb.gen1(INSTR.ucvtf_float_int(0,1,Rn,Vd));     // ucvtf d31,w0
                      break;
-@@ -1696,6 +1723,12 @@
+@@ -1696,6 +1775,12 @@
              callclib(cdb,e,clib,pretregs,0);
              break;
  
@@ -1400,7 +1628,7 @@ diff -ruN dmd-2.113.1/compiler/src/dmd/backend/arm/cod4.d dmd-2.113.1/compiler/s
          default:
              assert(0);
      }
-@@ -1748,7 +1781,10 @@
+@@ -1748,7 +1833,10 @@
              Extend extend = e1.Eoper == OPu8_16 ? Extend.UXTB : Extend.UXTH;
              cs.Sextend = cast(ubyte)((cs.Sextend & 8) | extend);  // preserve S bit
              reg_t reg = allocreg(cdb,retregs,TYint);
@@ -1412,7 +1640,7 @@ diff -ruN dmd-2.113.1/compiler/src/dmd/backend/arm/cod4.d dmd-2.113.1/compiler/s
              cdb.gen(&cs);
              freenode(e1.E1);
              freenode(e1);
-@@ -1784,7 +1820,8 @@
+@@ -1784,7 +1872,8 @@
          Extend extend = e1.Eoper == OPs8_16 ? Extend.SXTB : Extend.SXTH;
          cs.Sextend = cast(ubyte)((cs.Sextend & 8) | extend);  // preserve S bit
          reg_t reg = allocreg(cdb,retregs,TYint);
@@ -1422,7 +1650,7 @@ diff -ruN dmd-2.113.1/compiler/src/dmd/backend/arm/cod4.d dmd-2.113.1/compiler/s
          cdb.gen(&cs);
          freenode(e1.E1);
          freenode(e1);
-@@ -1821,8 +1858,11 @@
+@@ -1821,8 +1910,11 @@
              {
                  //    INSTR.log_imm(sf,opc,N,immr,imms,Rn,Rd)
                  uint N,immr,imms;
@@ -1436,7 +1664,7 @@ diff -ruN dmd-2.113.1/compiler/src/dmd/backend/arm/cod4.d dmd-2.113.1/compiler/s
                  cdb.gen1(ins);
              }
              else
-@@ -1863,7 +1903,8 @@
+@@ -1863,7 +1955,8 @@
                      if (cs.reg != NOREG)
                      {
                          uint N,immr,imms;
@@ -1446,7 +1674,7 @@ diff -ruN dmd-2.113.1/compiler/src/dmd/backend/arm/cod4.d dmd-2.113.1/compiler/s
                          uint ins = INSTR.log_imm(0,0,0,immr,imms,cs.reg,reg); // AND Xreg,Xcsreg,#0xFFFF
                          cdb.gen1(ins);
                      }
-@@ -1904,7 +1945,8 @@
+@@ -1904,7 +1997,8 @@
              if (op == OPu16_32)
              {
                  uint N,immr,imms;
@@ -1456,7 +1684,7 @@ diff -ruN dmd-2.113.1/compiler/src/dmd/backend/arm/cod4.d dmd-2.113.1/compiler/s
                  uint ins = INSTR.log_imm(0,0,0,immr,imms,reg,reg); // AND reg,reg,#0xFFFF
                  cdb.gen1(ins);
              }
-@@ -2040,7 +2082,8 @@
+@@ -2040,7 +2134,8 @@
          else
          {
              uint N,immr,imms;
