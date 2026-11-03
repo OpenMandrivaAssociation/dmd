@@ -504,7 +504,7 @@ diff -ruN dmd-2.113.1/compiler/src/dmd/backend/arm/cod1.d dmd-2.113.1/compiler/s
              const regm_t pregm = mask(preg);
 diff -ruN dmd-2.113.1/compiler/src/dmd/backend/arm/cod2.d dmd-2.113.1/compiler/src/dmd/backend/arm/cod2.d
 --- dmd-2.113.1/compiler/src/dmd/backend/arm/cod2.d	2026-10-31 15:30:53.000000000 +0100
-+++ dmd-2.113.1/compiler/src/dmd/backend/arm/cod2.d	2026-11-03 00:56:16.871674204 +0100
++++ dmd-2.113.1/compiler/src/dmd/backend/arm/cod2.d	2026-11-03 03:22:58.397948964 +0100
 @@ -163,7 +163,8 @@
                  default:
                      assert(0);
@@ -915,7 +915,33 @@ diff -ruN dmd-2.113.1/compiler/src/dmd/backend/arm/cod2.d dmd-2.113.1/compiler/s
              }
              break;
  
-@@ -2404,7 +2559,8 @@
+@@ -2296,9 +2451,16 @@
+         case FL.bprel:
+         case FL.fltreg:
+             cgstate.reflocal = true;
++            // x86 loadea(LEA) sets SFLread. A struct blit is an OPvar, not
++            // an OPrelconst, so the local stays SFLunambig until -O. Without
++            // SFLread, Symbol_Sisdead is true when not optimizing and not -g:
++            // the slot is not allocated and assignaddrc deletes
++            // `add reg,x29,#off`, leaving `add reg,reg,#0`.
++            e.Vsym.Sflags |= SFLread;
+             goto L2;
+         case FL.para:
+             cgstate.refparam = true;
++            e.Vsym.Sflags |= SFLread;
+         L2:
+             if (reg == STACK)
+             {   regm_t retregs = ALLREGS;
+@@ -2335,7 +2497,7 @@
+                     // https://www.scs.stanford.edu/~zyedidia/arm64/add_addsub_shift.html
+                     cdb.gen1(INSTR.addsub_shift(1,0,0,0,R16,0,reg,reg)); // ADD/SUB reg,reg,R16
+                 }
+-                else
++                else if (off)
+                     // https://www.scs.stanford.edu/~zyedidia/arm64/encodingindex.html#addsub_imm
+                     cdb.gen1(INSTR.addsub_imm(1,op,0,sh,off,reg,reg)); // ADD/SUB reg,reg,Voffset
+                 // TODO AArch64 common subexpressions?
+@@ -2404,7 +2566,8 @@
              // https://www.scs.stanford.edu/~zyedidia/arm64/fmov_float_gen.html
              cdb.gen1(INSTR.fmov_float_gen(1,2,1,6,Vn,Xn)); // Top half of 128-bit to 64-bit
              uint N, immr, imms;
@@ -925,7 +951,7 @@ diff -ruN dmd-2.113.1/compiler/src/dmd/backend/arm/cod2.d dmd-2.113.1/compiler/s
              uint sf = 1, opc = 2;
              cdb.gen1(INSTR.log_imm(sf,opc,N,immr,imms,Xn,Xn)); // https://www.scs.stanford.edu/~zyedidia/arm64/eor_log_imm.html
              cdb.gen1(INSTR.fmov_float_gen(1,2,1,7,Xn,Vn)); // 64-bit to top half of 128-bit
-@@ -2481,7 +2637,8 @@
+@@ -2481,7 +2644,8 @@
              // https://www.scs.stanford.edu/~zyedidia/arm64/fmov_float_gen.html
              cdb.gen1(INSTR.fmov_float_gen(1,2,1,6,Vn,Xn)); // Top half of 128-bit to 64-bit
              uint N, immr, imms;
@@ -935,7 +961,7 @@ diff -ruN dmd-2.113.1/compiler/src/dmd/backend/arm/cod2.d dmd-2.113.1/compiler/s
              uint sf = 1, opc = 0;
              cdb.gen1(INSTR.log_imm(sf,opc,N,immr,imms,Xn,Xn)); // https://www.scs.stanford.edu/~zyedidia/arm64/eor_log_imm.html
              cdb.gen1(INSTR.fmov_float_gen(1,2,1,7,Xn,Vn)); // 64-bit to top half of 128-bit
-@@ -2532,7 +2689,10 @@
+@@ -2532,7 +2696,10 @@
      op = 1;
      S = 0;
      uint Rm = Rn;
@@ -947,7 +973,7 @@ diff -ruN dmd-2.113.1/compiler/src/dmd/backend/arm/cod2.d dmd-2.113.1/compiler/s
      uint o2 = 1;
      ins = (sf     << 31) |
            (op     << 30) |
-@@ -2595,8 +2755,9 @@
+@@ -2595,8 +2762,9 @@
      {
          gentstreg(cdb,cs.reg,sz == 8);          // CMP cs.reg,#0
  
@@ -959,7 +985,7 @@ diff -ruN dmd-2.113.1/compiler/src/dmd/backend/arm/cod2.d dmd-2.113.1/compiler/s
  
          const n = e2.Vint;
          uint opx = e.Eoper == OPpostinc ? 0 : 1;
-@@ -2624,8 +2785,12 @@
+@@ -2624,8 +2792,12 @@
              pretregs &= ~mPSW;
          }
  
