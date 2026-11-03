@@ -5,6 +5,11 @@
 %bcond bootstrap_ldc 0
 %endif
 
+# The binaries' only DWARF is compiler-rt crtbegin, whose sources are
+# outside this build, so debugsourcefiles.list is empty.
+%global _enable_debug_packages 0
+%global debug_package %{nil}
+
 %define bits %{__isa_bits}
 %define phobos %mklibname phobos-dmd
 # 32-bit dmd.conf must point at /usr/lib even on a 64-bit build.
