@@ -2420,7 +2420,21 @@ diff -ruN dmd-2.113.1/compiler/src/dmd/backend/x86/cod3.d dmd-2.113.1/compiler/s
              assert(!AArch64);
              if (tybasic(tym) == TYreal || tybasic(tym) == TYireal)
              {
-@@ -3882,16 +3922,37 @@
+@@ -1865,7 +1905,12 @@
+             movregconst(cdb,sreg,val,sz == 8  ? 64 : 0);
+             getregsNoSave(retregs);
+             assert(reg2 == NOREG);
+-            cdb.gen1(INSTR.cmp_subs_addsub_shift(sz == 8, reg, 0, 0, sreg));    // CMP sreg,reg
++            // CMP reg,sreg. Rn is the switch value and Rm is the case
++            // constant. CS then means "unsigned greater", which is how the
++            // binary search chooses the upper half. The other operand order
++            // still gets equality right, but walks the wrong half for every
++            // case value that does not fit in an imm12.
++            cdb.gen1(INSTR.cmp_subs_addsub_shift(sz == 8, sreg, 0, 0, reg));
+         }
+     }
+     else if (I64 && sz == 8)
+@@ -3882,16 +3927,37 @@
          if (config.fulltypes == CVDWARF_C || config.fulltypes == CVDWARF_D ||
              config.ehmethod == EHmethod.EH_DWARF)
          {
@@ -2468,7 +2482,7 @@ diff -ruN dmd-2.113.1/compiler/src/dmd/backend/x86/cod3.d dmd-2.113.1/compiler/s
          }
          enter = false;              /* do not use ENTER instruction */
      }
-@@ -4034,6 +4095,7 @@
+@@ -4034,6 +4100,7 @@
      }
  }
  
@@ -2476,7 +2490,7 @@ diff -ruN dmd-2.113.1/compiler/src/dmd/backend/x86/cod3.d dmd-2.113.1/compiler/s
  void prolog_frameadj2(ref CGstate cg, ref CodeBuilder cdb, tym_t tyf, uint xlocalsize, bool* pushalloc)
  {
      enum log = false;
-@@ -4043,6 +4105,22 @@
+@@ -4043,6 +4110,22 @@
          /* sub sp,sp,#xlocalsize
           */
          cod3_stackadj(cdb, xlocalsize);
@@ -2499,7 +2513,7 @@ diff -ruN dmd-2.113.1/compiler/src/dmd/backend/x86/cod3.d dmd-2.113.1/compiler/s
          return;
      }
  
-@@ -4668,9 +4746,18 @@
+@@ -4668,9 +4751,18 @@
                      if (AArch64)
                      {
                          // STR preg,[sp,#offset]
@@ -2518,7 +2532,7 @@ diff -ruN dmd-2.113.1/compiler/src/dmd/backend/x86/cod3.d dmd-2.113.1/compiler/s
                          if (mask(preg) & INSTR.FLOATREGS)
                          {
                              uint size, opc;
-@@ -4823,6 +4910,63 @@
+@@ -4823,6 +4915,63 @@
          }
          // MOV reg,param[BP]
          //assert(refparam);
@@ -2582,7 +2596,7 @@ diff -ruN dmd-2.113.1/compiler/src/dmd/backend/x86/cod3.d dmd-2.113.1/compiler/s
          if (mask(s.Sreglsw) & XMMREGS)
          {
              const op = xmmload(s.Stype.Tty);  // MOVSS/D xreg,mem
-@@ -5639,7 +5783,15 @@
+@@ -5639,7 +5788,15 @@
              case SC.regpar:
              case SC.shadowreg:
  //printf("s = '%s', Soffset = x%x, Para.size = x%x, EBPtoESP = x%x\n", s.Sident, s.Soffset, cgstate.Para.size, cgstate.EBPtoESP);
