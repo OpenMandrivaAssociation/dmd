@@ -18,7 +18,7 @@ diff -ruN dmd-2.113.1/compiler/src/dmd/argtypes_aarch64.d dmd-2.113.1/compiler/s
      }
 diff -ruN dmd-2.113.1/compiler/src/dmd/backend/arm/cod1.d dmd-2.113.1/compiler/src/dmd/backend/arm/cod1.d
 --- dmd-2.113.1/compiler/src/dmd/backend/arm/cod1.d	2026-10-31 15:30:53.000000000 +0100
-+++ dmd-2.113.1/compiler/src/dmd/backend/arm/cod1.d	2026-11-03 01:08:28.721048397 +0100
++++ dmd-2.113.1/compiler/src/dmd/backend/arm/cod1.d	2026-11-03 01:35:52.149425639 +0100
 @@ -35,7 +35,7 @@
  import dmd.backend.rtlsym;
  import dmd.backend.ty;
@@ -357,7 +357,27 @@ diff -ruN dmd-2.113.1/compiler/src/dmd/backend/arm/cod1.d dmd-2.113.1/compiler/s
  {
      //printf("callclib(e = %p, clib = %d, pretregs = %s, keepmask = %s\n", e, clib, regm_str(pretregs), regm_str(keepmask));
      //elem_print(e);
-@@ -1673,7 +1853,15 @@
+@@ -1657,23 +1837,33 @@
+ 
+     getregs(cdb,(~s.Sregsaved & (INSTR.ALLREGS | INSTR.FLOATREGS | mask(cgstate.BP)) & ~keepmask)); // mask of regs destroyed
+     keepmask &= ~s.Sregsaved;
+-    int npushed = popcnt(keepmask);
+     CodeBuilder cdbpop;
+     cdbpop.ctor();
++    // Frame slots, not PUSH. Counting them as stack growth subtracted 8
++    // from an aligned SP, so BL entered __netf2 with SP%16==8 and the
++    // callee's STP faulted with SIGBUS on hardware (ABF 685005).
+     gensaverestore(keepmask, cdb, cdbpop);
+ 
+     makeitextern(s);
+     int nalign = 0;
+     if (STACKALIGN >= 16)
+     {   // Align the stack (assume no args on stack)
+-        int npush = npushed * REGSIZE + cgstate.stackpush;
++        int npush = cgstate.stackpush;
+         if (npush & (STACKALIGN - 1))
+         {   nalign = STACKALIGN - (npush & (STACKALIGN - 1));
+             cod3_stackadj(cdb, nalign);
          }
      }
  
@@ -373,7 +393,7 @@ diff -ruN dmd-2.113.1/compiler/src/dmd/backend/arm/cod1.d dmd-2.113.1/compiler/s
      if (nalign)
          cod3_stackadj(cdb, -nalign);
      cgstate.calledafunc = 1;
-@@ -1827,6 +2015,14 @@
+@@ -1827,6 +2017,14 @@
          if (alignsize > STACKALIGN)
              alignsize = STACKALIGN;         // no point if the stack is less aligned
  
@@ -388,7 +408,7 @@ diff -ruN dmd-2.113.1/compiler/src/dmd/backend/arm/cod1.d dmd-2.113.1/compiler/s
          /* Alignment on OSX64 AArch64 is the same as for struct fields.
           * If it is a variadic function, the last parameter (lastPar) is aligned on 8 bytes.
           * Match behavior in backend.arm.cod1.cdfunc()
-@@ -1838,7 +2034,10 @@
+@@ -1838,7 +2036,10 @@
  
          p.offset = numpara;
          //printf("[%d] param offset =  x%x, alignsize = %d\n", i, cast(int) numpara, cast(int) alignsize);
@@ -400,7 +420,7 @@ diff -ruN dmd-2.113.1/compiler/src/dmd/backend/arm/cod1.d dmd-2.113.1/compiler/s
      }
  
      //printf("numpara: %d STACKALIGN: %d\n", numpara, STACKALIGN);
-@@ -2168,12 +2367,18 @@
+@@ -2168,12 +2369,18 @@
          {
              s = getRtlsym(RTLSYM.ALLOCA);
              makeitextern(s);
@@ -425,7 +445,7 @@ diff -ruN dmd-2.113.1/compiler/src/dmd/backend/arm/cod1.d dmd-2.113.1/compiler/s
          }
          if (sytab[s.Sclass] & SCSS)    // if function is on stack (!)
          {
-@@ -2443,6 +2648,9 @@
+@@ -2443,6 +2650,9 @@
      scodelem(cgstate,cdb, e, retregs, 0, true);
      if (isPair)
      {
@@ -435,7 +455,7 @@ diff -ruN dmd-2.113.1/compiler/src/dmd/backend/arm/cod1.d dmd-2.113.1/compiler/s
          uint szx = cast(uint)tysize(tym) / 2;
          const reg_t rmsw = findreg(retregs & INSTR.MSW);
          code cs;
-@@ -2450,14 +2658,14 @@
+@@ -2450,14 +2660,14 @@
          cs.base = INSTR.SP;
          cs.index = NOREG;
          cs.IFL1 = FL.offset;
@@ -453,7 +473,7 @@ diff -ruN dmd-2.113.1/compiler/src/dmd/backend/arm/cod1.d dmd-2.113.1/compiler/s
          cs.IEV1.Voffset = funcargtos;
          cdb.gen(&cs);
      }
-@@ -2613,6 +2821,16 @@
+@@ -2613,6 +2823,16 @@
      }
      else
      {
@@ -470,7 +490,7 @@ diff -ruN dmd-2.113.1/compiler/src/dmd/backend/arm/cod1.d dmd-2.113.1/compiler/s
          // See if we can use register that parameter was passed in
          //printf("xyzzy1 %s %d %d\n", e.Vsym.Sident.ptr, cast(int)cgstate.regcon.params, regParamInPreg(e.Vsym));
          if (cgstate.regcon.params &&
-@@ -2620,7 +2838,10 @@
+@@ -2620,7 +2840,10 @@
              !cgstate.anyiasm &&   // may have written to the memory for the parameter
              (cgstate.regcon.params & mask(e.Vsym.Spreg) && e.Voffset == 0 ||
               cgstate.regcon.params & mask(e.Vsym.Spreg2) && e.Voffset == REGSIZE) &&
