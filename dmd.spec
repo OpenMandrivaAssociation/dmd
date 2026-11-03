@@ -61,8 +61,8 @@ This package contains the documentation.
 %license LICENSE.txt
 %{_bindir}/dmd
 %{_sysconfdir}/dmd.conf
-%{_mandir}/man1/*.1
-%{_mandir}/man5/*.5
+%{_mandir}/man1/*.1*
+%{_mandir}/man5/*.5*
 %{_libdir}/libphobos2.a
 %{_includedir}/dlang/dmd/*
 
